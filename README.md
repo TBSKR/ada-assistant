@@ -60,6 +60,13 @@ Controls
 - Mic: “MIC ON/OFF” button (green = live, red = muted).
 - Status: Left panel shows system stats and tool activity.
 
+Screenshot
+----------
+
+Below is a current snapshot of the desktop UI (TARS theme):
+
+![TARS UI](docs/screenshot.png)
+
 TARS Persona
 ------------
 
