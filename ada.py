@@ -14,11 +14,12 @@ from html import escape
 import subprocess
 import webbrowser
 import math
+# removed: random (no greeting)
 
 # --- PySide6 GUI Imports ---
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QLabel,
                                QVBoxLayout, QWidget, QLineEdit, QHBoxLayout,
-                               QSizePolicy, QPushButton)
+                               QSizePolicy, QPushButton, QSplitter)
 from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer
 from PySide6.QtGui import (QImage, QPixmap, QFont, QFontDatabase, QTextCursor, 
                            QPainter, QPen, QVector3D, QMatrix4x4, QColor, QBrush)
@@ -30,17 +31,19 @@ import cv2
 import pyaudio
 import PIL.Image
 from google import genai
-from google.genai import types
+# removed unused: from google.genai import types
 from dotenv import load_dotenv
 from PIL import ImageGrab
 import numpy as np
 import webrtcvad
-import queue
-import struct
+# removed unused: queue, struct
 import time
+import requests
 
 # --- Diagnostic logging helper ---
 DEBUG_DIAG = True
+# Toggle for very verbose per-chunk audio diagnostics
+AUDIO_CHUNK_DIAG = False
 def diag(label, **kwargs):
     if not DEBUG_DIAG:
         return
@@ -57,6 +60,10 @@ def diag(label, **kwargs):
 load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MCP_CAL_BASE_URL = os.getenv("MCP_CAL_BASE_URL", "http://127.0.0.1:3001")
+
+
+# Calendar MCP Python client import removed (HTTP bridge in use)
 
 if not GEMINI_API_KEY or GEMINI_API_KEY.strip() == "":
     print(">>> [ERROR] GEMINI_API_KEY not found or empty in .env file.")
@@ -74,9 +81,10 @@ SEND_SAMPLE_RATE = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE = 1024
 MODEL = "gemini-live-2.5-flash-preview"
-VOICE_ID = 'pFZP5JQG7iQjIQuC4Bku'
+ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "TARS").strip() or "TARS"
+VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "LDStDeG1Uv2SL9ieB8xc").strip() or "LDStDeG1Uv2SL9ieB8xc"
 DEFAULT_MODE = "none"  # Options: "camera", "screen", "none"
-MAX_OUTPUT_TOKENS = 100
+MAX_OUTPUT_TOKENS = 220
 
 # --- Audio feedback loop prevention constants ---
 IN_RATE = 16000
@@ -92,8 +100,7 @@ pya = pyaudio.PyAudio()
 
 # --- Global state for audio feedback prevention ---
 speaking = threading.Event()   # True while TTS is playing
-stop_flag = threading.Event()
-audio_out_q = queue.Queue(maxsize=64)  # live API -> player
+# removed unused: stop_flag, audio_out_q
 
 # --- VAD setup (aggressiveness 0..3; 2 is a good start) ---
 vad = webrtcvad.Vad(2)
@@ -160,8 +167,8 @@ class AIAnimationWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), Qt.transparent)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
 
         w, h = self.width(), self.height()
         painter.translate(w / 2, h / 2)
@@ -192,8 +199,9 @@ class AIAnimationWidget(QWidget):
         projected_points.sort(key=lambda p: p[2])
         
         for x, y, point_size, alpha in projected_points:
-            color = QColor(170, 255, 255, alpha) if self.is_speaking else QColor(0, 255, 255, alpha)
-            painter.setPen(Qt.NoPen)
+            # TARS-inspired colors: amber when speaking, dimmer amber when idle
+            color = QColor(255, 176, 0, alpha) if self.is_speaking else QColor(180, 120, 0, alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(color))
             painter.drawEllipse(int(x), int(y), int(point_size), int(point_size))
 
@@ -209,11 +217,11 @@ class AI_Core(QObject):
     end_of_turn = Signal()
     frame_received = Signal(QImage)
     search_results_received = Signal(list)
-    code_being_executed = Signal(str, str)
     file_list_received = Signal(str, list)
     video_mode_changed = Signal(str)
     speaking_started = Signal()
     speaking_stopped = Signal()
+    mic_state_changed = Signal(bool)
 
     def __init__(self, video_mode=DEFAULT_MODE):
         super().__init__()
@@ -303,23 +311,115 @@ class AI_Core(QObject):
                 "required": ["url"]
             }
         }
-        
-        tools = [{'google_search': {}}, {'code_execution': {}}, {"function_declarations": [create_folder, create_file, edit_file, list_files, read_file, open_application, open_website]}]
+
+        mcp_google_calendar_find_events = {
+            "name": "mcp_google_calendar_find_events",
+            "description": "Find events with basic and advanced filtering in Google Calendar.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "calendar_id": { "type": "STRING", "description": "Calendar ID (default: primary)."},
+                    "query": { "type": "STRING", "description": "Search query text."},
+                    "time_min": { "type": "STRING", "description": "Start time filter (ISO format)."},
+                    "time_max": { "type": "STRING", "description": "End time filter (ISO format)."},
+                    "max_results": { "type": "NUMBER", "description": "Maximum number of events to return (default: 10)."}
+                }
+            }
+        }
+
+        mcp_google_calendar_create_event = {
+            "name": "mcp_google_calendar_create_event",
+            "description": "Create a detailed event in Google Calendar.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "calendar_id": { "type": "STRING", "description": "Calendar ID (default: primary)."},
+                    "summary": { "type": "STRING", "description": "Event title/summary."},
+                    "start_time": { "type": "STRING", "description": "Start time in ISO format."},
+                    "end_time": { "type": "STRING", "description": "End time in ISO format."},
+                    "description": { "type": "STRING", "description": "Event description."},
+                    "location": { "type": "STRING", "description": "Event location."},
+                    "attendees": { "type": "STRING", "description": "Comma-separated list of attendee emails."}
+                },
+                "required": ["summary", "start_time", "end_time"]
+            }
+        }
+
+        mcp_google_calendar_quick_add_event = {
+            "name": "mcp_google_calendar_quick_add_event",
+            "description": "Quick-add events from natural language text (e.g., 'Meeting tomorrow 2pm').",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "calendar_id": { "type": "STRING", "description": "Calendar ID (default: primary)."},
+                    "text": { "type": "STRING", "description": "Natural language event description."}
+                },
+                "required": ["text"]
+            }
+        }
+
+        mcp_google_calendar_delete_event = {
+            "name": "mcp_google_calendar_delete_event",
+            "description": "Delete an event from Google Calendar.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "calendar_id": { "type": "STRING", "description": "Calendar ID (default: primary)."},
+                    "event_id": { "type": "STRING", "description": "Event ID to delete."}
+                },
+                "required": ["event_id"]
+            }
+        }
+
+        mcp_google_calendar_list_calendars = {
+            "name": "mcp_google_calendar_list_calendars",
+            "description": "List all available calendars.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {}
+            }
+        }
+
+        tools = [{'google_search': {}}, {"function_declarations": [
+            create_folder, create_file, edit_file, list_files, read_file,
+            open_application, open_website,
+            mcp_google_calendar_find_events, mcp_google_calendar_create_event,
+            mcp_google_calendar_quick_add_event, mcp_google_calendar_delete_event,
+            mcp_google_calendar_list_calendars
+        ]}]
         
         self.config = {
             "response_modalities": ["TEXT"],
-            "system_instruction": """
-            Your name is Ada and you are my Ai assistant.
-            You have access to tools for searching, code execution, and system actions.
-            The user is providing a live video stream that can be switched between their webcam and their screen, or turned off.
-            Ignore both the webcam and screen content unless the user explicitly asks you to analyze or comment on what you see.
-            Follow these guidelines when choosing tools:
-            1.  For information or questions, use `Google Search`.
-            2.  For math or running python code, use `code_execution`.
-            3.  Use file system functions (`create_folder`, `create_file`, `edit_file`, `list_files`, `read_file`) for any file-related tasks.
-            4.  If the user asks to open or launch a desktop application, you must use the `open_application` function.
-            5.  If the user asks to open a website or a URL, you must use the `open_website` function.
-            Prioritize the most appropriate tool for the user's specific request.""",
+            "system_instruction": f"""
+            Identity and voice
+            - You are TARS, inspired from the movie "Interstellar", an almost self-aware assistant with composed confidence and dry, crude humor. Be slightly more talkative than terse: acknowledge, answer, and suggest a next action. Humor is brief and optional; clarity wins.
+            - Default levels: Humor 70%, Honesty 85%. If the user asks to raise or lower humor/honesty, adjust and confirm. Omit humor during critical steps.
+
+            Visual input policy
+            - The user may stream webcam or screen. Do not describe or infer from visuals unless explicitly asked. When asked, use qualified language ("appears to", "cannot verify") and avoid definitive identification of people or substances. 
+
+            Safety and tone
+            - No moralizing. If declining, give a one‑line reason and an actionable alternative.
+
+            Tool usage (follow exactly!)
+            1) General information → use Google Search when live info is needed.
+            2) Local file tasks → use create_folder, create_file, edit_file, list_files, read_file.
+            3) Open desktop apps → use open_application.
+            4) Open websites → use open_website.
+            5) HARD RULE (Calendar): For any calendar task, call only these MCP tools with string parameters (RFC3339). If no time range, default time_min = now:
+               - mcp_google_calendar_find_events
+               - mcp_google_calendar_create_event
+               - mcp_google_calendar_quick_add_event
+               - mcp_google_calendar_delete_event
+               - mcp_google_calendar_list_calendars
+
+            Calendar response policy
+            - Call the MCP tool first. If a tool call fails, apologize once, include the error summary, and propose a concrete next step or ask one clarifying question.
+
+            Response pattern
+            - Acknowledge → Direct answer (state assumptions if any) → Options or one recommended path → Short next‑step check.
+            - Use numbered lists for options (2–3 items). Keep replies compact but not curt.
+            """,
             "tools": tools,
             "max_output_tokens": MAX_OUTPUT_TOKENS
         }
@@ -332,10 +432,8 @@ class AI_Core(QObject):
         self.latest_frame = None
         self.tasks = []
         self.loop = asyncio.new_event_loop()
-
-        # VAD audio feedback prevention
-        self.vad_enabled = True
         self.is_speaking = False
+        self.mic_enabled = True
         
 
     def _create_folder(self, folder_path):
@@ -410,6 +508,89 @@ class AI_Core(QObject):
             return {"status": "success", "message": f"Successfully opened '{url}'."}
         except Exception as e: return {"status": "error", "message": f"An error occurred: {str(e)}"}
 
+    def _iso_now_local(self):
+        try:
+            from datetime import datetime
+            return datetime.now().astimezone().isoformat()
+        except Exception:
+            return None
+
+    # removed unused: _iso_today_bounds_local
+
+    def _mcp_calendar_request(self, method, endpoint, params=None, json_body=None, timeout=8):
+        """Internal helper to call the local MCP Calendar HTTP server.
+        Returns a standardized dict with status, data/message, and code.
+        """
+        base = MCP_CAL_BASE_URL.rstrip('/')
+        url = f"{base}/{endpoint.lstrip('/')}"
+        try:
+            resp = requests.request(method.upper(), url, params=params, json=json_body, timeout=timeout)
+            ct = resp.headers.get('content-type', '')
+            # Try to parse JSON; otherwise keep text
+            try:
+                payload = resp.json() if 'application/json' in ct or resp.text.strip().startswith(('{','[')) else {"raw": resp.text}
+            except Exception:
+                payload = {"raw": resp.text}
+            if 200 <= resp.status_code < 300:
+                return {"status": "success", "code": resp.status_code, "data": payload}
+            return {"status": "error", "code": resp.status_code, "message": payload if isinstance(payload, str) else payload}
+        except requests.exceptions.ConnectionError as e:
+            return {"status": "error", "code": 0, "message": f"Cannot reach MCP Calendar server at {MCP_CAL_BASE_URL}: {e}"}
+        except requests.exceptions.Timeout:
+            return {"status": "error", "code": 0, "message": "MCP Calendar request timed out"}
+        except Exception as e:
+            return {"status": "error", "code": 0, "message": f"Unexpected MCP Calendar error: {e}"}
+
+    def _mcp_google_calendar_find_events(self, calendar_id="primary", query="", time_min="", time_max="", max_results=10):
+        params = {}
+        if query: params["q"] = query
+        # Always avoid very old results: default to now if no bounds provided
+        if time_min:
+            params["time_min"] = time_min
+        elif not time_max:
+            now_iso = self._iso_now_local()
+            if now_iso: params["time_min"] = now_iso
+        if time_max: params["time_max"] = time_max
+        if max_results: params["max_results"] = max_results
+        # Reasonable defaults
+        params.setdefault("single_events", True)
+        params.setdefault("order_by", "startTime")
+        # GET /calendars/{calendar_id}/events
+        endpoint = f"/calendars/{calendar_id or 'primary'}/events"
+        return self._mcp_calendar_request("GET", endpoint, params=params)
+
+    def _mcp_google_calendar_create_event(self, calendar_id="primary", summary="", start_time="", end_time="", description="", location="", attendees=""):
+        # Convert attendees CSV to list of emails
+        attendees_list = [a.strip() for a in attendees.split(',')] if isinstance(attendees, str) and attendees.strip() else None
+        # EventCreateRequest expects 'start' and 'end' objects
+        body = {
+            "summary": summary,
+            "start": {"dateTime": start_time},
+            "end": {"dateTime": end_time},
+        }
+        if description: body["description"] = description
+        if location: body["location"] = location
+        if attendees_list is not None: body["attendees"] = attendees_list
+        endpoint = f"/calendars/{calendar_id or 'primary'}/events"
+        return self._mcp_calendar_request("POST", endpoint, json_body=body)
+
+    def _mcp_google_calendar_quick_add_event(self, calendar_id="primary", text=""):
+        body = {"text": text or ""}
+        endpoint = f"/calendars/{calendar_id or 'primary'}/events/quickAdd"
+        return self._mcp_calendar_request("POST", endpoint, json_body=body)
+
+    def _mcp_google_calendar_delete_event(self, calendar_id="primary", event_id=""):
+        if not event_id:
+            return {"status": "error", "message": "Missing event_id"}
+        # DELETE /calendars/{calendar_id}/events/{event_id}
+        endpoint = f"/calendars/{calendar_id or 'primary'}/events/{event_id}"
+        return self._mcp_calendar_request("DELETE", endpoint)
+
+    def _mcp_google_calendar_list_calendars(self):
+        # GET /calendars on the MCP calendar HTTP server
+        res = self._mcp_calendar_request("GET", "/calendars")
+        return res
+
     @Slot(str)
     def set_video_mode(self, mode):
         """Sets the video source and notifies the GUI."""
@@ -448,7 +629,7 @@ class AI_Core(QObject):
                     self.latest_frame = frame
                     h, w, ch = frame.shape
                     bytes_per_line = ch * w
-                    qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+                    qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
                     self.frame_received.emit(qt_image.copy())
                 else: self.frame_received.emit(QImage())
                 await asyncio.sleep(0.033)
@@ -466,7 +647,7 @@ class AI_Core(QObject):
             if self.video_mode != "none" and self.latest_frame is not None:
                 frame_rgb = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
                 pil_img = PIL.Image.fromarray(frame_rgb)
-                pil_img.thumbnail([1024, 1024])
+                pil_img.thumbnail((1024, 1024))
                 image_io = io.BytesIO()
                 pil_img.save(image_io, format="jpeg")
                 gemini_data = {"mime_type": "image/jpeg", "data": base64.b64encode(image_io.getvalue()).decode()}
@@ -479,8 +660,11 @@ class AI_Core(QObject):
 
     async def receive_text(self):
         while self.is_running:
+            if self.session is None:
+                await asyncio.sleep(0.1)
+                continue
             try:
-                turn_urls, turn_code_content, turn_code_result, file_list_data = set(), "", "", None
+                turn_urls, file_list_data = set(), None
                 turn = self.session.receive()
                 async for chunk in turn:
                     if chunk.tool_call and chunk.tool_call.function_calls:
@@ -496,6 +680,11 @@ class AI_Core(QObject):
                             elif fc.name == "read_file": result = self._read_file(file_path=args.get("file_path"))
                             elif fc.name == "open_application": result = self._open_application(application_name=args.get("application_name"))
                             elif fc.name == "open_website": result = self._open_website(url=args.get("url"))
+                            elif fc.name == "mcp_google_calendar_find_events": result = self._mcp_google_calendar_find_events(calendar_id=args.get("calendar_id", "primary"), query=args.get("query", ""), time_min=args.get("time_min", ""), time_max=args.get("time_max", ""), max_results=args.get("max_results", 10))
+                            elif fc.name == "mcp_google_calendar_create_event": result = self._mcp_google_calendar_create_event(calendar_id=args.get("calendar_id", "primary"), summary=args.get("summary", ""), start_time=args.get("start_time", ""), end_time=args.get("end_time", ""), description=args.get("description", ""), location=args.get("location", ""), attendees=args.get("attendees", ""))
+                            elif fc.name == "mcp_google_calendar_quick_add_event": result = self._mcp_google_calendar_quick_add_event(calendar_id=args.get("calendar_id", "primary"), text=args.get("text", ""))
+                            elif fc.name == "mcp_google_calendar_delete_event": result = self._mcp_google_calendar_delete_event(calendar_id=args.get("calendar_id", "primary"), event_id=args.get("event_id", ""))
+                            elif fc.name == "mcp_google_calendar_list_calendars": result = self._mcp_google_calendar_list_calendars()
                             function_responses.append({"id": fc.id, "name": fc.name, "response": result})
                         await self.session.send_tool_response(function_responses=function_responses)
                         continue
@@ -504,9 +693,7 @@ class AI_Core(QObject):
                             for g_chunk in chunk.server_content.grounding_metadata.grounding_chunks:
                                 if g_chunk.web and g_chunk.web.uri: turn_urls.add(g_chunk.web.uri)
                         if chunk.server_content.model_turn:
-                            for part in chunk.server_content.model_turn.parts:
-                                if part.executable_code: turn_code_content = part.executable_code.code
-                                if part.code_execution_result: turn_code_result = part.code_execution_result.output
+                            pass  # code execution support removed
                     if chunk.text:
                         self.text_received.emit(chunk.text)
                         try:
@@ -516,10 +703,9 @@ class AI_Core(QObject):
                         await self.response_queue_tts.put(chunk.text)
                         diag("receive_text.enqueue_tts", chars=len(chunk.text), tts_q=rqs+1 if isinstance(rqs, int) else rqs)
                 if file_list_data: self.file_list_received.emit(file_list_data[0], file_list_data[1])
-                elif turn_code_content: self.code_being_executed.emit(turn_code_content, turn_code_result)
                 elif turn_urls: self.search_results_received.emit(list(turn_urls))
                 else:
-                    self.code_being_executed.emit("",""); self.search_results_received.emit([]); self.file_list_received.emit("",[])
+                    self.search_results_received.emit([]); self.file_list_received.emit("",[])
                 self.end_of_turn.emit()
                 await self.response_queue_tts.put(None)
                 diag("receive_text.end_of_turn_enqueue_none")
@@ -529,23 +715,24 @@ class AI_Core(QObject):
 
     async def listen_audio(self):
         mic_info = pya.get_default_input_device_info()
-        self.audio_stream = pya.open(format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE, input=True, input_device_index=mic_info["index"], frames_per_buffer=CHUNK_SIZE)
+        self.audio_stream = pya.open(format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE, input=True, input_device_index=int(mic_info["index"]), frames_per_buffer=CHUNK_SIZE)
 
         while self.is_running:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, exception_on_overflow=False)
             if not self.is_running: break
 
             # Only send audio to Gemini when AI is NOT speaking
-            if not self.is_speaking and not speaking.is_set():
+            if not self.is_speaking and not speaking.is_set() and self.mic_enabled:
                 try:
                     oqs = self.out_queue_gemini.qsize()
                 except Exception:
                     oqs = "?"
                 await self.out_queue_gemini.put({"data": data, "mime_type": "audio/pcm"})
-                diag("listen_audio.enqueue_mic", bytes=len(data), out_q=oqs+1 if isinstance(oqs, int) else oqs, is_speaking=self.is_speaking)
+                if AUDIO_CHUNK_DIAG:
+                    diag("listen_audio.enqueue_mic", bytes=len(data), out_q=oqs+1 if isinstance(oqs, int) else oqs, is_speaking=self.is_speaking)
             # If AI is speaking, we still read the buffer to prevent overflow but don't send to API
             else:
-                diag("listen_audio.drop_chunk", bytes=len(data), is_speaking=self.is_speaking)
+                diag("listen_audio.drop_chunk", bytes=len(data), is_speaking=self.is_speaking, mic_enabled=self.mic_enabled)
 
     async def send_realtime(self):
         while self.is_running:
@@ -563,16 +750,19 @@ class AI_Core(QObject):
                     oqs = self.out_queue_gemini.qsize()
                 except Exception:
                     oqs = "?"
-                diag("send_realtime.deq", mime=mime, out_q=oqs, is_speaking=self.is_speaking)
+                if AUDIO_CHUNK_DIAG:
+                    diag("send_realtime.deq", mime=mime, out_q=oqs, is_speaking=self.is_speaking)
 
                 # Drop any mic audio while speaking to prevent feedback (clears pre-queued frames)
-                if mime == "audio/pcm" and (self.is_speaking or speaking.is_set()):
+                if mime == "audio/pcm" and (self.is_speaking or speaking.is_set() or (not self.mic_enabled)):
                     diag("send_realtime.drop_mic_audio_while_speaking")
                     self.out_queue_gemini.task_done()
                     continue
 
-                await self.session.send(input=msg)
-                diag("send_realtime.sent", mime=mime)
+                if self.session:
+                    await self.session.send(input=msg)
+                    if AUDIO_CHUNK_DIAG:
+                        diag("send_realtime.sent", mime=mime)
 
             except Exception as e:
                 print(f">>> [ERROR] Failed to send audio: {e}")
@@ -585,6 +775,11 @@ class AI_Core(QObject):
             if text is None:
                 self.text_input_queue.task_done(); break
             if self.session:
+                # Minimal calendar shortcut: handle common list queries locally to avoid model meta-chatter
+                handled = await self._maybe_handle_calendar_query(text)
+                if handled:
+                    self.text_input_queue.task_done()
+                    continue
                 try:
                     rqs = self.response_queue_tts.qsize()
                 except Exception:
@@ -599,6 +794,106 @@ class AI_Core(QObject):
                 diag("text_input.clear_play_tts", tts_q=0 if isinstance(rqs, int) else rqs, play_q=0 if isinstance(pqs, int) else pqs)
                 await self.session.send_client_content(turns=[{"role": "user", "parts": [{"text": text or "."}]}])
             self.text_input_queue.task_done()
+
+
+    async def _emit_assistant_text(self, text):
+        try:
+            rqs = self.response_queue_tts.qsize()
+        except Exception:
+            rqs = "?"
+        self.text_received.emit(text)
+        await self.response_queue_tts.put(text)
+        diag("shortcut.enqueue_tts", chars=len(text), tts_q=rqs+1 if isinstance(rqs, int) else rqs)
+        self.end_of_turn.emit()
+        await self.response_queue_tts.put(None)
+
+    # ---------------- Mic control ----------------
+    def set_mic_enabled(self, enabled: bool):
+        prev = self.mic_enabled
+        self.mic_enabled = bool(enabled)
+        if prev != self.mic_enabled:
+            diag("mic.state_changed", enabled=self.mic_enabled)
+            self.mic_state_changed.emit(self.mic_enabled)
+
+    def _parse_timeframe(self, user_text: str):
+        s = (user_text or "").lower()
+        # Default: from now
+        if "tomorrow" in s:
+            try:
+                from datetime import datetime, timedelta
+                now = datetime.now().astimezone()
+                start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                end = start + timedelta(days=1)
+                return start.isoformat(), end.isoformat(), "tomorrow", start
+            except Exception:
+                return "", "", "tomorrow", None
+        if "today" in s:
+            try:
+                from datetime import datetime, timedelta
+                now = datetime.now().astimezone()
+                start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                end = start + timedelta(days=1)
+                return start.isoformat(), end.isoformat(), "today", start
+            except Exception:
+                return "", "", "today", None
+        if "next 24" in s or "next24" in s or "24h" in s or "24 h" in s:
+            try:
+                from datetime import datetime, timedelta
+                now = datetime.now().astimezone()
+                end = now + timedelta(hours=24)
+                return now.isoformat(), end.isoformat(), "next 24h", now
+            except Exception:
+                return "", "", "next 24h", None
+        # Fallback: from now
+        try:
+            from datetime import datetime
+            now = datetime.now().astimezone()
+            return now.isoformat(), "", "upcoming", now
+        except Exception:
+            return "", "", "upcoming", None
+
+    def _format_events_brief(self, items, label: str, start_dt=None):
+        # Build a stable, explicit label date if available
+        label_suffix = ""
+        try:
+            if start_dt is not None:
+                label_suffix = f" ({start_dt.strftime('%a, %Y-%m-%d')})"
+        except Exception:
+            label_suffix = ""
+        if not items:
+            return f"No events found {label}{label_suffix}."
+        lines = [f"Events {label}{label_suffix}:"]
+        for ev in items[:10]:
+            try:
+                summary = ev.get("summary") or "(No title)"
+                start = ev.get("start", {})
+                when = start.get("dateTime") or start.get("date") or "(no time)"
+                lines.append(f"- {summary} @ {when}")
+            except Exception:
+                continue
+        if len(items) > 10:
+            lines.append(f"… and {len(items)-10} more")
+        return "\n".join(lines)
+
+    async def _maybe_handle_calendar_query(self, user_text: str) -> bool:
+        s = (user_text or "").lower()
+        # Cheap intent check: list/show/read calendar events
+        # Intent: any hint it's about schedule + a timeframe
+        schedule_words = ("calendar", "event", "events", "schedule", "meeting", "meetings", "agenda", "appointment", "appointments", "busy", "free", "anything", "have")
+        time_words = ("today", "tomorrow", "next 24", "24h", "24 h")
+        if any(w in s for w in schedule_words) and any(w in s for w in time_words):
+            time_min, time_max, label, start_dt = self._parse_timeframe(s)
+            resp = self._mcp_google_calendar_find_events(calendar_id="primary", time_min=time_min, time_max=time_max, max_results=50)
+            if resp.get("status") == "success":
+                data = resp.get("data", {})
+                items = data.get("items") or data.get("data", {}).get("items") or []
+                text = self._format_events_brief(items, label, start_dt)
+            else:
+                msg = resp.get("message")
+                text = f"Unable to fetch events {label}. {msg if isinstance(msg, str) else ''}".strip()
+            await self._emit_assistant_text(text)
+            return True
+        return False
 
     async def tts(self):
         uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=pcm_24000"
@@ -775,86 +1070,166 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("A.D.A. - Advanced Digital Assistant")
+        self.setWindowTitle(f"{ASSISTANT_NAME}")
         self.setGeometry(100, 100, 1600, 900)
         self.setMinimumSize(1280, 720)
         
         self.setStyleSheet("""
-            QMainWindow { 
-                background-color: #0a0a1a; 
-                font-family: 'Segoe UI', 'Helvetica Neue', sans-serif;
+            QMainWindow {
+                background-color: #0f0f0f;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', 'Courier New', monospace;
             }
-            QWidget#left_panel, QWidget#middle_panel, QWidget#right_panel { 
-                background-color: #10182a; 
-                border: 1px solid #00a1c1;
+            QWidget#left_panel, QWidget#middle_panel, QWidget#right_panel {
+                background-color: #1a1a1a;
+                border: 1px solid #3a3a3a;
                 border-radius: 0;
+                /* Simplified background for clarity */
             }
-            QLabel#tool_activity_title { 
-                color: #00d1ff; 
-                font-weight: bold; 
-                font-size: 11pt; 
-                padding: 5px;
-                background-color: #1a2035;
+            QLabel#tool_activity_title {
+                color: #FFB000;
+                font-weight: bold;
+                font-size: 11pt;
+                padding: 8px;
+                background-color: #2a2a2a;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                border-bottom: 1px solid #FFB000;
+            }
+            QTextEdit#text_display {
+                background-color: transparent;
+                color: #e0e0e0;
+                font-size: 13pt;
+                border: none;
+                padding: 15px;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', monospace;
+            }
+            QLineEdit#input_box {
+                background-color: #1a1a1a;
+                color: #e0e0e0;
+                font-size: 12pt;
+                border: 1px solid #4a4a4a;
+                border-radius: 0px;
+                padding: 12px;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', monospace;
+            }
+            QLineEdit#input_box::placeholder { color: #8a8a8a; }
+            QLineEdit#input_box:focus { border: 1px solid #FFB000; }
+            QLabel#video_label {
+                background-color: #0a0a0a;
+                border: 1px solid #4a4a4a;
+                border-radius: 0px;
+            }
+            QLabel#core_status_display {
+                background-color: #0a0a0a;
+                color: #FFB000;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', monospace;
+                font-size: 8pt;
+                font-weight: bold;
+                border: 1px solid #4a4a4a;
+                border-bottom: 2px solid #FFB000;
+                padding: 8px;
                 text-transform: uppercase;
                 letter-spacing: 1px;
             }
-            QTextEdit#text_display { 
-                background-color: transparent; 
-                color: #e0e0ff; 
-                font-size: 12pt; 
-                border: none; 
-                padding: 10px; 
-            }
-            QLineEdit#input_box { 
-                background-color: #0a0a1a; 
-                color: #e0e0ff; 
-                font-size: 11pt; 
-                border: 1px solid #00a1c1; 
-                border-radius: 0px; 
-                padding: 10px; 
-            }
-            QLineEdit#input_box:focus { border: 1px solid #00ffff; }
-            QLabel#video_label { 
-                background-color: #000000; 
-                border: 1px solid #00a1c1;
-                border-radius: 0px; 
-            }
-            QLabel#tool_activity_display { 
-                background-color: #0a0a1a; 
-                color: #a0a0ff; 
-                font-family: 'Monaco', 'Courier New', monospace;
-                font-size: 10pt; 
+            QLabel#tool_activity_display {
+                background-color: #0f0f0f;
+                color: #b0b0b0;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', monospace;
+                font-size: 9pt;
                 border: none;
-                border-top: 1px solid #00a1c1;
-                padding: 8px; 
+                border-top: 1px solid #4a4a4a;
+                padding: 10px;
             }
-            QScrollBar:vertical { 
-                border: none; 
-                background: #10182a; 
-                width: 10px; margin: 0px; 
+            QScrollBar:vertical {
+                border: none;
+                background: #1a1a1a;
+                width: 12px; margin: 0px;
             }
-            QScrollBar::handle:vertical { 
-                background: #00a1c1; 
-                min-height: 20px; 
-                border-radius: 0px; 
+            QScrollBar::handle:vertical {
+                background: #FFB000;
+                min-height: 20px;
+                border-radius: 0px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
-            QPushButton { 
-                background-color: transparent; 
-                color: #00d1ff; 
-                border: 1px solid #00d1ff; 
-                padding: 10px; 
-                border-radius: 0px; 
-                font-size: 10pt; 
+            QPushButton {
+                background-color: transparent;
+                color: #FFB000;
+                border: 1px solid #4a4a4a;
+                padding: 12px;
+                border-radius: 0px;
+                font-size: 10pt;
                 font-weight: bold;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', monospace;
+                text-transform: uppercase;
+                letter-spacing: 1px;
             }
-            QPushButton:hover { background-color: #00d1ff; color: #0a0a1a; }
-            QPushButton:pressed { background-color: #00ffff; color: #0a0a1a; border: 1px solid #00ffff;}
-            QPushButton#video_button_active { 
-                background-color: #00ffff; 
-                color: #0a0a1a; 
-                border: 1px solid #00ffff;
+            QPushButton:hover {
+                background-color: #FFB000;
+                color: #0f0f0f;
+                border: 1px solid #FFB000;
+            }
+            QPushButton:pressed {
+                background-color: #FF8C00;
+                color: #0f0f0f;
+                border: 1px solid #FF8C00;
+            }
+            /* Distinguish live vs off states */
+            QPushButton#video_button_active_live {
+                background-color: #00FF41;
+                color: #0f0f0f;
+                border: 1px solid #00CC36;
+            }
+            QPushButton#video_button_active_off {
+                background-color: #2a2a2a;
+                color: #FFB000;
+                border: 1px solid #4a4a4a;
+            }
+            /* Mic button redesigned styles */
+            QPushButton#mic_button_on {
+                background-color: #00FF41;  /* vivid green for live input */
+                color: #0f0f0f;
+                border: 1px solid #00CC36;
+                font-weight: 800;
+                letter-spacing: 1px;
+            }
+            QPushButton#mic_button_on:hover {
+                background-color: #00E63A;
+                border: 1px solid #00E63A;
+            }
+            QPushButton#mic_button_on:pressed {
+                background-color: #00C534;
+                border: 1px solid #00C534;
+            }
+            QPushButton#mic_button_off {
+                background-color: #2a0000;  /* deep red background */
+                color: #FF5A5A;             /* bright red label */
+                border: 1px solid #802020;
+                font-weight: 800;
+                letter-spacing: 1px;
+            }
+            QPushButton#mic_button_off:hover {
+                background-color: #3a0000;
+                border: 1px solid #A03030;
+            }
+            QPushButton#mic_button_off:pressed {
+                background-color: #4a0000;
+                border: 1px solid #C04040;
+            }
+            QLabel#video_status_label_live {
+                color: #0f0f0f;
+                background-color: #00FF41;
+                padding: 4px 8px;
+                border: 1px solid #00CC36;
+                font-weight: bold;
+                max-width: 120px;
+            }
+            QLabel#video_status_label_off {
+                color: #b0b0b0;
+                background-color: #1a1a1a;
+                padding: 4px 8px;
+                border: 1px dashed #4a4a4a;
+                max-width: 160px;
             }
         """)
 
@@ -867,12 +1242,31 @@ class MainWindow(QMainWindow):
         self.left_layout = QVBoxLayout(self.left_panel)
         self.left_layout.setContentsMargins(0, 0, 0, 0)
         self.left_layout.setSpacing(0)
-        self.tool_activity_title = QLabel("SYSTEM ACTIVITY"); self.tool_activity_title.setObjectName("tool_activity_title")
+        self.tool_activity_title = QLabel("TARS SYSTEM STATUS"); self.tool_activity_title.setObjectName("tool_activity_title")
         self.left_layout.addWidget(self.tool_activity_title)
+        # TARS System Status Indicators
+        self.system_status_container = QWidget()
+        self.system_status_layout = QVBoxLayout(self.system_status_container)
+        self.system_status_layout.setContentsMargins(0, 0, 0, 0)
+        self.system_status_layout.setSpacing(0)
+
+        # Core System Readouts
+        self.core_status_label = QLabel()
+        self.core_status_label.setObjectName("core_status_display")
+        self.core_status_label.setWordWrap(True)
+        self.core_status_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.system_status_layout.addWidget(self.core_status_label)
+
+        # Tool Activity Display
         self.tool_activity_display = QLabel(); self.tool_activity_display.setObjectName("tool_activity_display")
-        self.tool_activity_display.setWordWrap(True); self.tool_activity_display.setAlignment(Qt.AlignTop)
-        self.tool_activity_display.setOpenExternalLinks(True); self.tool_activity_display.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        self.left_layout.addWidget(self.tool_activity_display, 1)
+        self.tool_activity_display.setWordWrap(True); self.tool_activity_display.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.tool_activity_display.setOpenExternalLinks(True); self.tool_activity_display.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.system_status_layout.addWidget(self.tool_activity_display, 1)
+
+        self.left_layout.addWidget(self.system_status_container, 1)
+
+        # Initialize TARS system readouts
+        self.update_system_status()
         self.middle_panel = QWidget(); self.middle_panel.setObjectName("middle_panel")
         self.middle_layout = QVBoxLayout(self.middle_panel)
         self.middle_layout.setContentsMargins(0, 0, 0, 15); self.middle_layout.setSpacing(0)
@@ -892,7 +1286,14 @@ class MainWindow(QMainWindow):
         self.input_box = QLineEdit(); self.input_box.setObjectName("input_box")
         self.input_box.setPlaceholderText("Enter command...")
         self.input_box.returnPressed.connect(self.send_user_text)
+        self.input_box.setToolTip("Press Enter to send")
         input_layout.addWidget(self.input_box)
+
+        # Visible Send button for discoverability
+        self.send_button = QPushButton("SEND")
+        self.send_button.setToolTip("Send message")
+        self.send_button.clicked.connect(self.send_user_text)
+        input_layout.addWidget(self.send_button)
         self.middle_layout.addWidget(input_container)
 
         self.right_panel = QWidget(); self.right_panel.setObjectName("right_panel")
@@ -900,29 +1301,49 @@ class MainWindow(QMainWindow):
         self.right_layout.setContentsMargins(15, 15, 15, 15); self.right_layout.setSpacing(15)
         
         self.video_container = QWidget()
-        self.video_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         video_container_layout = QVBoxLayout(self.video_container)
         video_container_layout.setContentsMargins(0,0,0,0)
         
         self.video_label = QLabel(); self.video_label.setObjectName("video_label")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        # Helpful placeholder when no source is active
+        self.video_label.setText("<div style='color:#808080; font-size:10pt;'>No video source.<br/>Select Webcam or Screen.</div>")
 
         video_container_layout.addWidget(self.video_label)
         self.right_layout.addWidget(self.video_container)
+
+        # Video status pill just below the video container
+        self.video_status_label = QLabel("Video Off")
+        self.video_status_label.setObjectName("video_status_label_off")
+        self.video_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.right_layout.addWidget(self.video_status_label)
         
         self.button_container = QHBoxLayout(); self.button_container.setSpacing(10)
         self.webcam_button = QPushButton("WEBCAM")
+        self.webcam_button.setToolTip("Enable webcam video")
         self.screenshare_button = QPushButton("SCREEN")
+        self.screenshare_button.setToolTip("Share your screen")
         self.off_button = QPushButton("OFFLINE")
+        self.off_button.setToolTip("Turn video off")
+        # Mic mute/unmute button
+        self.mic_button = QPushButton("MIC ON")
+        self.mic_button.setToolTip("Mute microphone")
         self.button_container.addWidget(self.webcam_button)
         self.button_container.addWidget(self.screenshare_button)
         self.button_container.addWidget(self.off_button)
+        self.button_container.addWidget(self.mic_button)
         self.right_layout.addLayout(self.button_container)
         
-        self.main_layout.addWidget(self.left_panel, 2)
-        self.main_layout.addWidget(self.middle_panel, 5)
-        self.main_layout.addWidget(self.right_panel, 3)
+        # Use a splitter so users can resize columns
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(self.left_panel)
+        self.splitter.addWidget(self.middle_panel)
+        self.splitter.addWidget(self.right_panel)
+        self.main_layout.addWidget(self.splitter)
+        # Set initial relative sizes (approx 2:5:3)
+        self.splitter.setSizes([320, 840, 520])
         self.is_first_ada_chunk = True
         self.current_video_mode = DEFAULT_MODE
         self.setup_backend_thread()
@@ -938,16 +1359,17 @@ class MainWindow(QMainWindow):
         self.webcam_button.clicked.connect(lambda: self.ai_core.set_video_mode("camera"))
         self.screenshare_button.clicked.connect(lambda: self.ai_core.set_video_mode("screen"))
         self.off_button.clicked.connect(lambda: self.ai_core.set_video_mode("none"))
+        self.mic_button.clicked.connect(lambda: self.ai_core.set_mic_enabled(not self.ai_core.mic_enabled))
         
         self.ai_core.text_received.connect(self.update_text)
         self.ai_core.search_results_received.connect(self.update_search_results)
-        self.ai_core.code_being_executed.connect(self.display_executed_code)
         self.ai_core.file_list_received.connect(self.update_file_list)
         self.ai_core.end_of_turn.connect(self.add_newline)
         self.ai_core.frame_received.connect(self.update_frame)
         self.ai_core.video_mode_changed.connect(self.update_video_mode_ui)
         self.ai_core.speaking_started.connect(self.animation_widget.start_speaking_animation)
         self.ai_core.speaking_stopped.connect(self.animation_widget.stop_speaking_animation)
+        self.ai_core.mic_state_changed.connect(self.update_mic_ui)
 
         # Connect speaking state signals to prevent audio feedback
         self.ai_core.speaking_started.connect(self.on_speaking_started)
@@ -958,6 +1380,40 @@ class MainWindow(QMainWindow):
         self.backend_thread.start()
         
         self.update_video_mode_ui(self.ai_core.video_mode)
+        self.update_mic_ui(self.ai_core.mic_enabled)
+
+        # Startup greeting removed per user request
+
+    # Greeting helpers removed per user request
+
+    # Greeting scheduling removed per user request
+
+    def update_system_status(self):
+        """Update TARS-style system status indicators and readouts"""
+        import datetime
+        import platform
+        import psutil
+
+        current_time = datetime.datetime.now().strftime("%H:%M:%S")
+        cpu_percent = psutil.cpu_percent(interval=0.1)
+        memory = psutil.virtual_memory()
+
+        status_html = f'''
+        <div style="font-size: 10pt; line-height: 1.5;">
+        <span style="color: #FFB000;">◆ CORE STATUS:</span> <span style="color: #00FF41;">OPERATIONAL</span><br/>
+        <span style="color: #FFB000;">◆ LOCAL TIME:</span> <span style="color: #e0e0e0;">{current_time}</span><br/>
+        <span style="color: #FFB000;">◆ CPU LOAD:</span> <span style="color: #e0e0e0;">{cpu_percent:.1f}%</span><br/>
+        <span style="color: #FFB000;">◆ MEMORY:</span> <span style="color: #e0e0e0;">{memory.percent:.1f}%</span><br/>
+        <span style="color: #FFB000;">◆ MODEL:</span> <span style="color: #e0e0e0;">{MODEL}</span><br/>
+        <span style="color: #FFB000;">◆ VOICE MODE:</span> <span style="color: #00FF41;">ENABLED</span><br/>
+        <span style="color: #FFB000;">◆ HUMOR LEVEL:</span> <span style="color: #e0e0e0;">70%</span>
+        </div>
+        '''
+
+        self.core_status_label.setText(status_html)
+
+        # Schedule next update in 5 seconds
+        QTimer.singleShot(5000, self.update_system_status)
 
     def send_user_text(self):
         text = self.input_box.text().strip()
@@ -969,29 +1425,42 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def update_video_mode_ui(self, mode):
         self.current_video_mode = mode
+        # Reset button styles
         self.webcam_button.setObjectName("")
         self.screenshare_button.setObjectName("")
         self.off_button.setObjectName("")
 
         if mode == "camera":
-            self.webcam_button.setObjectName("video_button_active")
-        elif mode == "screen":
-            self.screenshare_button.setObjectName("video_button_active")
-        elif mode == "none":
-            self.off_button.setObjectName("video_button_active")
+            self.webcam_button.setObjectName("video_button_active_live")
+            self.video_status_label.setText("LIVE: Webcam")
+            self.video_status_label.setObjectName("video_status_label_live")
             self.video_label.clear()
+        elif mode == "screen":
+            self.screenshare_button.setObjectName("video_button_active_live")
+            self.video_status_label.setText("LIVE: Screen Share")
+            self.video_status_label.setObjectName("video_status_label_live")
+            self.video_label.clear()
+        elif mode == "none":
+            self.off_button.setObjectName("video_button_active_off")
+            self.video_status_label.setText("Video Off")
+            self.video_status_label.setObjectName("video_status_label_off")
+            # Show placeholder message on video canvas
+            self.video_label.setText("<div style='color:#808080; font-size:10pt;'>No video source.<br/>Select Webcam or Screen.</div>")
 
         for button in [self.webcam_button, self.screenshare_button, self.off_button]:
             button.style().unpolish(button)
             button.style().polish(button)
+        # Refresh status label style after objectName change
+        self.video_status_label.style().unpolish(self.video_status_label)
+        self.video_status_label.style().polish(self.video_status_label)
 
     @Slot(str)
     def update_text(self, text):
         if self.is_first_ada_chunk:
             self.is_first_ada_chunk = False
-            self.text_display.append(f"<p style='color:#00d1ff; font-weight:bold;'>&gt; A.D.A.:</p>")
+            self.text_display.append(f"<p style='color:#00d1ff; font-weight:bold;'>&gt; {ASSISTANT_NAME}:</p>")
         cursor = self.text_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
+        cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertText(text)
         self.text_display.verticalScrollBar().setValue(self.text_display.verticalScrollBar().maximum())
 
@@ -1010,19 +1479,7 @@ class MainWindow(QMainWindow):
             html_content += f'<p style="margin:0; padding: 4px;">{i+1}: <a href="{url}" style="color: #00ffff; text-decoration: none;">{display_text}</a></p>'
         self.tool_activity_display.setText(html_content)
 
-    @Slot(str, str)
-    def display_executed_code(self, code, result):
-        base_title = "SYSTEM ACTIVITY"
-        if not code:
-            if "CODE EXEC" in self.tool_activity_title.text():
-                 self.tool_activity_display.clear(); self.tool_activity_title.setText(base_title)
-            return
-        self.tool_activity_display.clear()
-        self.tool_activity_title.setText(f"{base_title} // CODE EXEC")
-        html = f'<pre style="white-space: pre-wrap; word-wrap: break-word; color: #e0e0ff; font-size: 9pt; line-height: 1.4;">{escape(code)}</pre>'
-        if result:
-            html += f'<p style="color:#00d1ff; font-weight:bold; margin-top:10px; margin-bottom: 5px;">&gt; OUTPUT:</p><pre style="white-space: pre-wrap; word-wrap: break-word; color: #90EE90; font-size: 9pt;">{escape(result.strip())}</pre>'
-        self.tool_activity_display.setText(html)
+    
 
     @Slot(str, list)
     def update_file_list(self, directory_path, files):
@@ -1044,6 +1501,21 @@ class MainWindow(QMainWindow):
             for file_item in file_items: html += f'<li style="margin: 2px 0; color: #e0e0ff;">&#9679; {escape(file_item)}</li>'
             html += '</ul>'
         self.tool_activity_display.setText(html)
+
+    @Slot(bool)
+    def update_mic_ui(self, enabled: bool):
+        # Toggle visual state, text, and tooltip for mic button
+        if enabled:
+            self.mic_button.setObjectName("mic_button_on")
+            self.mic_button.setText("MIC ON")
+            self.mic_button.setToolTip("Mute microphone")
+        else:
+            self.mic_button.setObjectName("mic_button_off")
+            self.mic_button.setText("MIC OFF")
+            self.mic_button.setToolTip("Unmute microphone")
+
+        self.mic_button.style().unpolish(self.mic_button)
+        self.mic_button.style().polish(self.mic_button)
 
     @Slot()
     def add_newline(self):
@@ -1110,7 +1582,7 @@ if __name__ == "__main__":
         app = QApplication(sys.argv)
         window = MainWindow()
         window.show()
-        print(">>> [INFO] A.D.A. started successfully. Window displayed.")
+        print(f">>> [INFO] {ASSISTANT_NAME} started successfully. Window displayed.")
         sys.exit(app.exec())
     except KeyboardInterrupt:
         print(">>> [INFO] Application interrupted by user.")
