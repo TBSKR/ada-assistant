@@ -1,162 +1,127 @@
-Advanced Digital Assistant (A.D.A.)
-===================================
+TARS (A.D.A.) — Real‑Time Desktop AI Assistant
+=============================================
 
-A.D.A. is an advanced, real-time digital assistant built with Google's **Gemini-live-2.5-flash-preview** model. It features a responsive graphical user interface (GUI) using **PySide6**, real-time audio communication, and the ability to process live video from either a webcam or a screen share. A.D.A. is equipped with powerful tools for searching, code execution, and managing your local file system.
+A.D.A. now ships with a TARS‑inspired persona and a streamlined, high‑contrast UI. It runs locally with a PySide6 desktop app, speaks via ElevenLabs, listens in real time, and can see your webcam or screen on demand. A Google Calendar MCP bridge is included for standards‑based scheduling.
 
-  
-FOR FULL VIDEO TUTORIAL: https://www.youtube.com/watch?v=aooylKf-PeA
-  
+Highlights
+----------
 
-Features
+- Voice‑to‑voice: Low‑latency conversation using Google Gemini Live + ElevenLabs TTS.
+- Visuals: Toggle Webcam, Screen, or Off; video shows in the right panel.
+- TARS persona: Friendly, candid, dry wit (brief), slightly more talkative with clear next steps.
+- UI polish: Resizable columns, clearer status, explicit video status pill, redesigned mic control.
+- Mic mute: Dedicated MIC ON/OFF button with bold green/red states; audio is actually muted in the pipeline.
+- Calendar MCP: Calls a Google Calendar MCP server over HTTP; list, find, create, quick‑add, delete.
+
+Quick Start
+-----------
+
+1) Prerequisites
+
+- Python 3.10+
+- macOS/Linux/Windows (macOS recommended)
+- PortAudio (for PyAudio)
+  - macOS: `brew install portaudio`
+  - Ubuntu: `sudo apt-get install portaudio19-dev`
+- API keys: Gemini + ElevenLabs
+
+2) Install
+
+```bash
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+3) Configure environment
+
+Create `.env` in the repo root:
+
+```
+GEMINI_API_KEY="your_gemini_key"
+ELEVENLABS_API_KEY="your_elevenlabs_key"
+# Optional
+# ASSISTANT_NAME=TARS
+# ELEVENLABS_VOICE_ID=LDStDeG1Uv2SL9ieB8xc
+# MCP_CAL_BASE_URL=http://127.0.0.1:3001
+```
+
+4) Run
+
+```bash
+python ada.py --mode none   # or: camera | screen
+```
+
+Controls
 --------
 
-*   🗣️ **Real-time Conversation**: Seamless, low-latency voice-to-voice interaction powered by Google Gemini and ElevenLabs TTS.
-    
-*   👀 **Live Visual Input**: A.D.A. can see what you see, with the ability to switch between a live **webcam** feed and a **screen share**. This allows it to answer questions about on-screen content, debug code visually, or provide guidance as you work.
-    
-*   🛠️ **Integrated Tooling**: The assistant can perform a variety of actions by invoking powerful tools, including:
-    
-    *   **Google Search**: For real-time information retrieval.
-        
-    *   **Code Execution**: To run and debug Python code.
-        
-    *   **File System Management**: Create, edit, read, and list files and folders on your computer.
-        
-    *   **System Actions**: Open applications and websites.
-        
-*   🎨 **Dynamic UI**: A responsive and visually appealing GUI built with PySide6, featuring a **3D animated avatar** that pulses when the assistant is speaking.
-    
-*   💻 **Cross-Platform**: Designed to work on Windows, macOS, and Linux.
-    
+- Input: type in the bottom bar (Enter to send). A Send button is also available.
+- Video: WEBCAM / SCREEN / OFF toggle in the right panel.
+- Mic: “MIC ON/OFF” button (green = live, red = muted).
+- Status: Left panel shows system stats and tool activity.
 
-Setup
------
+TARS Persona
+------------
 
-Follow these steps to get A.D.A. up and running on your local machine.
+The assistant is configured to be a bit more talkative with a calm, dry wit. It acknowledges, answers succinctly, offers options when requests are vague, and ends with a short next‑step prompt. Visual analysis is opt‑in and carefully qualified.
 
-### 1\. Prerequisites
+Calendar MCP (Google Calendar)
+------------------------------
 
-Before you begin, ensure you have the following installed:
+This app calls an external Google Calendar MCP server over HTTP. You must run that server yourself.
 
-*   **Python 3.9+**
-*   **Git**: [Download Git](https://git-scm.com/downloads)
-*   **Gemini API Key**: Get your key from [Google AI Studio](https://aistudio.google.com/app/apikey).
-*   **ElevenLabs API Key**: Get your key from the [ElevenLabs website(Affiliate Link Helps Me Out)](https://try.elevenlabs.io/6alaeznm5itg).
+- Base URL: `MCP_CAL_BASE_URL` (defaults to `http://127.0.0.1:3001`).
+- Tools mapped: list calendars, find events, create event, quick‑add, delete event.
 
-### 2\. Clone the Repository
+Quick setup (summary)
 
-Clone this project's repository from GitHub:
+1. Install the official Calendar MCP server globally:
 
 ```bash
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
+npm install -g @google/calendar-mcp
 ```
 
-### 3\. Create a Virtual Environment
+2. Start the MCP Calendar server per its docs (auth flow may open a browser).
 
-It's highly recommended to use a virtual environment to manage dependencies cleanly.
-
-**On Windows:**
-```bash
-python -m venv venv
-venv\Scripts\activate
-```
-
-**On macOS/Linux:**
-```bash
-python -m venv venv
-source venv/bin/activate
-```
-
-### 4\. Install Dependencies
-
-With your virtual environment active, install all the required Python packages with a single command:
+3. Verify A.D.A. can reach it (optional script):
 
 ```bash
-pip install google-genai python-dotenv elevenlabs PySide6 opencv-python Pillow numpy websockets pyaudio
+node tests/calendar_bridge_test.mjs
 ```
 
-> **Note**: On some systems, `PyAudio` can be tricky to install. If you encounter issues, you may need to install system-level development libraries first (e.g., `portaudio`). Please refer to the PyAudio documentation for platform-specific instructions.
+For details, see `MCP_CALENDAR_INTEGRATION.md` in this repo.
 
-### 5\. Configure API Keys
+Configuration
+-------------
 
-Create a file named `.env` in the project's root directory to store your API keys securely.
+- `GEMINI_API_KEY`: Required.
+- `ELEVENLABS_API_KEY`: Required.
+- `ASSISTANT_NAME`: Optional; defaults to `TARS`.
+- `ELEVENLABS_VOICE_ID`: Optional; pick a voice with your preferred cadence.
+- `MCP_CAL_BASE_URL`: Optional; URL of the running Calendar MCP HTTP server.
 
-Add your API keys to the .env file:
+Notes on Voice Speed
+--------------------
 
-```
-GEMINI_API_KEY="YOUR_GEMINI_API_KEY_HERE"
-ELEVENLABS_API_KEY="YOUR_ELEVENLABS_API_KEY_HERE"
-```
-
-> **Important**: Do not share or commit your .env file to GitHub. The project's .gitignore file is configured to ignore it.
-
-Usage
------
-
-### Running the Application
-
-Ensure your virtual environment is active, then run the main Python script:
-
-```bash
-python ada.py
-```
-
-### Command-line Arguments
-
-You can specify the initial video mode when launching the application:
-
-*   \--mode camera: Starts with the webcam feed active.
-    
-*   \--mode screen: Starts with screen sharing active.
-    
-*   \--mode none: Starts without a video feed (default).
-    
-
-**Example**:
-
-```bash
-python ada.py --mode camera
-```
-
-### Interacting with A.D.A.
-
-*   **Voice**: The application listens in real-time. Simply speak to the assistant to begin a conversation.
-    
-*   **Text**: Use the input box to type commands or questions.
-    
-*   **Video Mode Buttons**: Use the "WEBCAM", "SCREEN", and "OFFLINE" buttons on the right panel to change the visual input source.
-    
-
-A.D.A. can answer questions, run code, manage files, open applications, and analyze content on your screen.
+The code streams to ElevenLabs without an explicit speed control. Pace is mainly set by the chosen voice/model. If your ElevenLabs setup supports a speed/prosody parameter for stream‑input, that would be configured in the initial TTS handshake.
 
 Troubleshooting
 ---------------
 
-If you encounter any issues, here are some common problems and their solutions:
+- Missing keys: Ensure `.env` exists and the keys are non‑empty.
+- Mic doesn’t work: Grant microphone permission to your terminal/IDE; confirm the correct default input device.
+- Camera black: Grant camera permission; ensure no other app is using the webcam.
+- PyAudio issues: Install PortAudio (see prerequisites) and reinstall PyAudio.
+- Calendar MCP errors: Confirm the MCP server is running and reachable at `MCP_CAL_BASE_URL`.
 
-### 1. API Key Errors
+Security & Privacy
+------------------
 
-*   **Symptom**: The application closes immediately after starting, with an error message like `Error: GEMINI_API_KEY not found`.
-*   **Solution**:
-    1.  **Check `.env` file location**: Ensure your `.env` file is in the root directory of the project, alongside `ada.py`.
-    2.  **Verify Key Names**: Make sure the variable names in your `.env` file are exactly `GEMINI_API_KEY` and `ELEVENLABS_API_KEY`.
-    3.  **Check Key Values**: Confirm that you have correctly pasted your API keys without any extra spaces or characters.
+- `.env` is git‑ignored; never commit keys.
+- The app does not persist transcripts by default.
+- Calendar MCP calls happen to your local/hosted MCP server; manage credentials there.
 
-### 2. Microphone Not Working
+License
+-------
 
-*   **Symptom**: A.D.A. does not respond to your voice commands.
-*   **Solution**:
-    1.  **Grant Permissions**: Your operating system may be blocking microphone access.
-        *   **Windows**: Go to `Settings > Privacy & security > Microphone` and ensure "Let desktop apps access your microphone" is enabled.
-        *   **macOS**: Go to `System Settings > Privacy & Security > Microphone` and make sure your terminal or code editor has permission.
-    2.  **Set Default Device**: The application uses your system's default input device. Check your OS sound settings to ensure the correct microphone is selected as the default.
-    3.  **PyAudio Installation**: If you see errors related to `PyAudio` or `PortAudio` on startup, you may need to reinstall it or install its system dependencies as mentioned in the setup guide.
-
-### 3. Video Feed Not Displaying
-
-*   **Symptom**: The video panel on the right is black when "WEBCAM" mode is active.
-*   **Solution**:
-    1.  **Grant Permissions**: Just like the microphone, your OS may be blocking camera access. Check your system's privacy settings for the camera.
-    2.  **Camera In Use**: Make sure no other application (like Zoom, Teams, OBS, etc.) is currently using your webcam.
-    3.  **Correct Device**: The script defaults to the first available camera (index 0). If you have multiple cameras, you may need to adjust the `cv2.VideoCapture(0)` line in `ada.py` to use a different index (e.g., `cv2.VideoCapture(1)`).
+See repository for license information. All trademarks and service marks belong to their respective owners.
