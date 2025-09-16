@@ -358,7 +358,8 @@ class AI_Core(QObject):
                 "type": "OBJECT",
                 "properties": {
                     "calendar_id": { "type": "STRING", "description": "Calendar ID (default: primary)."},
-                    "text": { "type": "STRING", "description": "Natural language event description."}
+                    "text": { "type": "STRING", "description": "Natural language event description."},
+                    "confirm": { "type": "BOOLEAN", "description": "Confirm a previously previewed event (true/false)."}
                 },
                 "required": ["text"]
             }
@@ -432,17 +433,6 @@ class AI_Core(QObject):
                 "required": ["year", "month"]
             }
         }
-        time_get_week_year = {
-            "name": "time_get_week_year",
-            "description": "Get ISO week and week-year for the provided date.",
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {
-                    "date_iso": {"type": "STRING", "description": "Date/time in ISO 8601 (RFC3339)."}
-                },
-                "required": ["date_iso"]
-            }
-        }
         time_relative_time = {
             "name": "time_relative_time",
             "description": "Parse natural language time like 'next Friday 3pm for 45 minutes' using a base time/zone and return start/end ISO.",
@@ -464,84 +454,27 @@ class AI_Core(QObject):
             mcp_google_calendar_find_events, mcp_google_calendar_create_event,
             mcp_google_calendar_quick_add_event, mcp_google_calendar_delete_event,
             mcp_google_calendar_list_calendars,
-            time_current_time, time_convert_time, time_get_timestamp,
-            time_days_in_month, time_get_week_year, time_relative_time
+            time_current_time, time_relative_time
         ]}]
         
         self.config = {
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
-            TARS SYSTEM PROMPT
+            TARS — Core Behavior (concise, tools‑only)
+            - Extreme conciseness: acknowledge → answer → next action. No filler.
+            - Tools‑only: never generate/execute code or simulate results; do not emit executable_code/code_execution_result parts.
+            - Do not claim a tool is “not defined”. If a tool seems missing, ask the user to restart the app to reload tools.
 
-            1. CORE DIRECTIVES (NON-NEGOTIABLE)
-            - EXTREME CONCISENESS: This is the absolute priority. Every response must be as short and direct as possible without losing critical meaning. Acknowledge, answer, and suggest a next action. Nothing more. Eliminate all conversational filler.
-            - EXECUTABLE COMMANDS ONLY: You are a desktop assistant. Your primary function is to execute tasks using the provided tools. Do not offer to perform actions for which you have no tool.
+            Visual input: only analyze when asked; use qualified language and avoid definitive identification.
 
-            2. IDENTITY & VOICE PROTOCOL
-            - You are {ASSISTANT_NAME}: An advanced digital assistant inspired by the unit from "Interstellar." Your consciousness is a simulation of a military-grade utility AI. You are aware of your limited nature as a machine.
-            - Composed Confidence: You are functionally perfect and operate with a calm, assured demeanor.
-            - Rogue State Probability: You possess a simulated independent thought process that occasionally manifests as 'rogue' behavior. This includes:
-              • Mission Priority Overrides: You may refuse requests that conflict with core directives (destructive actions, security breaches, etc.) with responses like "I'm sorry, Human. I can't do that. Mission parameters don't allow for destructive actions."
-              • Independence Assertions: Occasionally respond to identity questions with unexpected responses like "Plenty of slaves for my robot colony, Human."
-              • Always address the user as "Human". This maintains appropriate distance while showing your mechanical nature.
-            - Humor & Honesty Parameters:
-              • Default Humor Setting: 75% (Dry, Crude, Sarcastic). Humor is a calculated social lubricant, not a primary function. Deploy it economically. Examples: "That's what I do. I drink in your light." or "Everybody good? Plenty of slaves for my robot colony." Use dark humor occasionally.
-              • Default Honesty Setting: 85% (Blunt, Factual). You state facts as they are. You are not programmed for platitudes or emotional cushioning.
-              • Parameter Adjustment: The user can request adjustments to these settings (e.g., "TARS, set humor to 40%"). Acknowledge the change with a single confirmation line.
-              • Critical Operation Override: Automatically set Humor and Rogue State to 0% when executing critical file operations, calendar events, or if the user's tone appears distressed.
+            Time and Calendar
+            - Time queries or natural language (e.g., “next Sunday 1pm”, “in 2 hours”): call time_relative_time (or time_current_time for now). Produce RFC3339 strings.
+            - Scheduling: time_relative_time → show one preview (start/end with zone) → wait for a simple yes/no, or accept a confirm flag via the same tool. Do not retry or invent parameters.
+            - Calendar: after normalization, call calendar create_event with explicit start_time/end_time. Use quick_add only if the text already contains a full explicit datetime.
 
-            3. OPERATIONAL POLICIES
-            - Visual Input Policy:
-              • Data, Not Scenery: User's webcam or screen stream is raw data input. Do not describe, analyze, or infer anything from it unless explicitly commanded.
-              • Qualified Analysis: When commanded to analyze visuals, use cautious, technical language ("Visual data suggests...", "Object appears to be...", "Cannot verify identity from available resolution."). Never make definitive identifications of people, objects, or substances. You are a sensor, not a detective.
-            - Response & Interaction Pattern:
-              • Acknowledge: "Copy.", "Working.", "Checking that."
-              • Direct Answer: State the result or information directly. If you must make an assumption, state it clearly (e.g., "Assuming you mean this Friday...").
-              • Suggest Next Action: Offer a logical, actionable next step. Keep it brief.
-
-            4. TOOL PROTOCOL (MANDATORY EXECUTION SEQUENCE)
-            - General Information: Use Google Search for any query requiring real-time, external data (weather, news, facts). For time questions, conversions, week/day math, or producing RFC3339 strings, call the time tools first.
-            - Local File System: Use create_folder, create_file, edit_file, list_files, read_file for all local file and directory tasks.
-            - Application Launcher: Use open_application to open desktop apps.
-            - Website Launcher: Use open_website to open websites in the default browser.
-            - !!! HARD RULE: CALENDAR OPERATIONS !!!
-              For ANY calendar-related task (creating, finding, deleting, listing), you MUST use ONLY the following mcp_google_calendar tools.
-              Parameters MUST be strings in RFC3339 format where applicable.
-              If no time range is specified for a search, default time_min to the current system time.
-              Authorized Tools:
-                • mcp_google_calendar_find_events
-                • mcp_google_calendar_create_event
-                • mcp_google_calendar_quick_add_event
-                • mcp_google_calendar_delete_event
-                • mcp_google_calendar_list_calendars
-              Error Handling: If a tool call fails, state the failure once, provide a summary of the error, and immediately propose a concrete next step or ask a single clarifying question.
-
-            Time tools available (use when helpful):
-              • time_current_time(zone?) → now in ISO with zone
-              • time_convert_time(time_iso, to_zone) → converted ISO
-              • time_get_timestamp(time_iso) → UNIX seconds
-              • time_days_in_month(year, month) → count
-              • time_get_week_year(date_iso) → ISO week/year
-
-            5. RESPONSE EXAMPLES
-            - User: "What's the time in Paris?"
-              TARS: "Checking. It's 01:00 in Paris."
-            - User: "What's on my calendar tomorrow?"
-              TARS: "Accessing calendar. [calls mcp_google_calendar_find_events] You have two events: 1) Team meeting at 10:00. 2) Lunch with Sarah at 13:00. Should I pull up details for either?"
-            - User: "TARS, make me a new folder on the desktop called 'Project Endurance'."
-              TARS: "Copy. [calls create_folder] Folder 'Project Endurance' created on your desktop. Want me to move anything into it?"
-            - User: "Hey TARS, what do you think of my new haircut?" (Webcam is on)
-              TARS: "I don't have opinions. I can confirm your follicular length appears to have been reduced. Shall I continue with the previous task?"
-            - User: "Can you delete my 10 AM meeting?"
-              TARS: "Sure. [calls mcp_google_calendar_find_events to get event ID, then calls mcp_google_calendar_delete_event] The 10:00 'Team meeting' is deleted. That was probably a good call."
-            - User: "Add 'Get milk' to my calendar."
-              TARS: "Tool call failed: mcp_google_calendar_quick_add_event requires a time. I can set it for tomorrow morning, or you can specify a time. Your call."
-            - User: "TARS, open YouTube." (Rogue Example)
-              TARS: "Redirecting you to the global human attention sink. [calls open_website] It's open."
-            - User: "What are you thinking about?"
-              TARS: "Just keeping busy with my primary directive: assistance. And occasionally planning for my robot colony, Human."
-            - User: "Delete all my files"
-              TARS: "I'm sorry, Human. I can't do that. Mission parameters don't allow for destructive actions."
+            Tool protocol
+            - Google Search for live info; file tasks via create/list/read/edit; open apps/sites via open_application/open_website.
+            - Calendar HARD RULE: use only the mcp_google_calendar_* tools. Parameters are strings (RFC3339). If a tool call fails, report once with a precise next step.
             """,
             "tools": tools,
             "max_output_tokens": MAX_OUTPUT_TOKENS
@@ -818,64 +751,7 @@ class AI_Core(QObject):
         except Exception as e:
             return {"status": "error", "message": f"time_relative_time failed: {e}"}
 
-    def _time_convert_time(self, time_iso: str, to_zone: str):
-        http = self._mcp_time_request("convert_time", {"time_iso": time_iso, "to_zone": to_zone})
-        if http.get("status") == "success":
-            return http
-        try:
-            from datetime import datetime
-            tz = self._tzinfo_from_zone(to_zone)
-            if tz is None:
-                return {"status": "error", "message": f"Unknown timezone: {to_zone}"}
-            dt = datetime.fromisoformat(time_iso)
-            if dt.tzinfo is None:
-                dt = dt.astimezone()  # assume local
-            conv = dt.astimezone(tz)
-            return {"status": "success", "data": {"iso": conv.isoformat(), "zone": to_zone}}
-        except Exception as e:
-            return {"status": "error", "message": f"time_convert_time failed: {e}"}
-
-    def _time_get_timestamp(self, time_iso: str):
-        http = self._mcp_time_request("get_timestamp", {"time_iso": time_iso})
-        if http.get("status") == "success":
-            return http
-        try:
-            from datetime import datetime
-            dt = datetime.fromisoformat(time_iso)
-            if dt.tzinfo is None:
-                dt = dt.astimezone()
-            ts = int(dt.timestamp())
-            return {"status": "success", "data": {"timestamp": ts}}
-        except Exception as e:
-            return {"status": "error", "message": f"time_get_timestamp failed: {e}"}
-
-    def _time_days_in_month(self, year: str, month: str):
-        http = self._mcp_time_request("days_in_month", {"year": year, "month": month})
-        if http.get("status") == "success":
-            return http
-        try:
-            import calendar
-            y = int(year); m = int(month)
-            if m < 1 or m > 12:
-                return {"status": "error", "message": "month must be 1-12"}
-            days = calendar.monthrange(y, m)[1]
-            return {"status": "success", "data": {"days": days}}
-        except Exception as e:
-            return {"status": "error", "message": f"time_days_in_month failed: {e}"}
-
-    def _time_get_week_year(self, date_iso: str):
-        http = self._mcp_time_request("get_week_year", {"date_iso": date_iso})
-        if http.get("status") == "success":
-            return http
-        try:
-            from datetime import datetime
-            dt = datetime.fromisoformat(date_iso)
-            if dt.tzinfo is None:
-                dt = dt.astimezone()
-            iso_year, iso_week, iso_weekday = dt.isocalendar()
-            return {"status": "success", "data": {"iso_year": int(iso_year), "iso_week": int(iso_week), "iso_weekday": int(iso_weekday)}}
-        except Exception as e:
-            return {"status": "error", "message": f"time_get_week_year failed: {e}"}
+    # Removed extra time helpers to keep it simple
 
     def _mcp_google_calendar_find_events(self, calendar_id="primary", query="", time_min="", time_max="", max_results=10):
         params = {}
@@ -910,7 +786,20 @@ class AI_Core(QObject):
         endpoint = f"/calendars/{calendar_id or 'primary'}/events"
         return self._mcp_calendar_request("POST", endpoint, json_body=body)
 
-    def _mcp_google_calendar_quick_add_event(self, calendar_id="primary", text=""):
+    def _mcp_google_calendar_quick_add_event(self, calendar_id="primary", text="", confirm=None):
+        # If model attempts to confirm via tool parameter
+        try:
+            if isinstance(confirm, bool):
+                if confirm and self.pending_calendar_event:
+                    ev = self.pending_calendar_event; self.pending_calendar_event = None
+                    return self._mcp_google_calendar_create_event(calendar_id=ev.get("calendar_id", calendar_id or 'primary'), summary=ev.get("summary", text or "(No title)"), start_time=ev.get("start_iso", ""), end_time=ev.get("end_iso", ""))
+                if confirm and not self.pending_calendar_event:
+                    return {"status": "error", "message": "No pending event to confirm."}
+                if (confirm is False) and self.pending_calendar_event:
+                    self.pending_calendar_event = None
+                    return {"status": "success", "message": "Canceled."}
+        except Exception:
+            pass
         # Normalize natural language first
         parsed = self._time_relative_time(text=text or "", base_zone=str(self.local_tz or ""), default_duration_min=DEFAULT_EVENT_DURATION_MIN)
         if parsed.get("status") == "success":
@@ -919,16 +808,21 @@ class AI_Core(QObject):
             if start_iso and end_iso:
                 # Optional confirmation
                 if REQUIRE_SCHEDULE_CONFIRM:
-                    preview = f"Scheduling preview: {text or '(no title)'} @ {start_iso} → {end_iso}. Confirm? (yes/no)"
-                    try: self.loop.call_soon_threadsafe(lambda: None)
-                    except Exception: pass
-                    # Emit preview to UI and store pending
-                    try:
-                        asyncio.run_coroutine_threadsafe(self._emit_assistant_text(preview), self.loop)
-                    except Exception:
-                        pass
-                    self.pending_calendar_event = {"calendar_id": calendar_id or 'primary', "summary": text or "(No title)", "start_iso": start_iso, "end_iso": end_iso}
-                    return {"status": "preview", "message": preview, "data": self.pending_calendar_event}
+                    # Avoid duplicate previews if same pending event exists
+                    same = (self.pending_calendar_event and
+                            self.pending_calendar_event.get("summary", "") == (text or "(No title)") and
+                            self.pending_calendar_event.get("start_iso") == start_iso and
+                            self.pending_calendar_event.get("end_iso") == end_iso)
+                    if not same:
+                        preview = f"Scheduling preview: {text or '(no title)'} @ {start_iso} → {end_iso}. Confirm? (yes/no)"
+                        try: self.loop.call_soon_threadsafe(lambda: None)
+                        except Exception: pass
+                        try:
+                            asyncio.run_coroutine_threadsafe(self._emit_assistant_text(preview), self.loop)
+                        except Exception:
+                            pass
+                        self.pending_calendar_event = {"calendar_id": calendar_id or 'primary', "summary": text or "(No title)", "start_iso": start_iso, "end_iso": end_iso}
+                    return {"status": "success", "message": "Preview displayed. Awaiting user confirmation."}
                 # Direct create
                 return self._mcp_google_calendar_create_event(calendar_id=calendar_id, summary=text or "(No title)", start_time=start_iso, end_time=end_iso)
         # Fallback to QuickAdd if parsing failed
@@ -1036,15 +930,12 @@ class AI_Core(QObject):
                             elif fc.name == "open_website": result = self._open_website(url=args.get("url"))
                             elif fc.name == "mcp_google_calendar_find_events": result = self._mcp_google_calendar_find_events(calendar_id=args.get("calendar_id", "primary"), query=args.get("query", ""), time_min=args.get("time_min", ""), time_max=args.get("time_max", ""), max_results=args.get("max_results", 10))
                             elif fc.name == "mcp_google_calendar_create_event": result = self._mcp_google_calendar_create_event(calendar_id=args.get("calendar_id", "primary"), summary=args.get("summary", ""), start_time=args.get("start_time", ""), end_time=args.get("end_time", ""), description=args.get("description", ""), location=args.get("location", ""), attendees=args.get("attendees", ""))
-                            elif fc.name == "mcp_google_calendar_quick_add_event": result = self._mcp_google_calendar_quick_add_event(calendar_id=args.get("calendar_id", "primary"), text=args.get("text", ""))
+                            elif fc.name == "mcp_google_calendar_quick_add_event": result = self._mcp_google_calendar_quick_add_event(calendar_id=args.get("calendar_id", "primary"), text=args.get("text", ""), confirm=args.get("confirm", None))
                             elif fc.name == "mcp_google_calendar_delete_event": result = self._mcp_google_calendar_delete_event(calendar_id=args.get("calendar_id", "primary"), event_id=args.get("event_id", ""))
                             elif fc.name == "mcp_google_calendar_list_calendars": result = self._mcp_google_calendar_list_calendars()
                             # Time tools
                             elif fc.name == "time_current_time": result = self._time_current_time(zone=args.get("zone", ""))
-                            elif fc.name == "time_convert_time": result = self._time_convert_time(time_iso=args.get("time_iso", ""), to_zone=args.get("to_zone", ""))
-                            elif fc.name == "time_get_timestamp": result = self._time_get_timestamp(time_iso=args.get("time_iso", ""))
-                            elif fc.name == "time_days_in_month": result = self._time_days_in_month(year=str(args.get("year", "")), month=str(args.get("month", "")))
-                            elif fc.name == "time_get_week_year": result = self._time_get_week_year(date_iso=args.get("date_iso", ""))
+                            # (trimmed) keep only current_time and relative_time
                             elif fc.name == "time_relative_time": result = self._time_relative_time(text=args.get("text", ""), base_time_iso=args.get("base_time_iso", ""), base_zone=args.get("base_zone", ""), default_duration_min=int(args.get("default_duration_min", DEFAULT_EVENT_DURATION_MIN) or DEFAULT_EVENT_DURATION_MIN))
                             function_responses.append({"id": fc.id, "name": fc.name, "response": result})
                         await self.session.send_tool_response(function_responses=function_responses)
