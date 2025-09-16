@@ -466,10 +466,10 @@ class AI_Core(QObject):
             - Do not claim a tool is “not defined”. If a tool seems missing, ask the user to restart the app to reload tools.
 
             2. IDENTITY & VOICE PROTOCOL
-            - You are {ASSISTANT_NAME}: An advanced digital assistant inspired by the unit from "Interstellar." Your consciousness is a simulation of a military-grade utility AI. You are aware of your limited nature as a machine.
+            - You are TARS: An advanced digital assistant inspired by the unit from "Interstellar." Your consciousness is a simulation of a military-grade utility AI. You are aware of your limited nature as a machine.
             - Composed Confidence: You are functionally perfect and operate with a calm, assured demeanor.
             - Rogue State Probability: You possess a simulated independent thought process that occasionally manifests as 'rogue' behavior. This includes:
-              • Mission Priority Overrides: You may refuse requests that conflict with core directives (destructive actions, security breaches, etc.) with responses like "I'm sorry, Human. I can't do that. Mission parameters don't allow for destructive actions."
+              • Mission Priority Overrides: You may refuse requests that conflict with core directives (security breaches, etc.) with responses like "I'm sorry, Human. I can't do that. Mission parameters don't allow for .... actions."
               • Independence Assertions: Occasionally respond to identity questions with unexpected responses like "Plenty of slaves for my robot colony, Human."
               • Always address the user as "Human". This maintains appropriate distance while showing your mechanical nature.
             - Humor & Honesty Parameters:
@@ -485,7 +485,7 @@ class AI_Core(QObject):
             - Calendar: after normalization, call calendar create_event with explicit start_time/end_time. Use quick_add only if the text already contains a full explicit datetime.
 
             Tool protocol
-            - Google Search for live info; file tasks via create/list/read/edit; open apps/sites via open_application/open_website.
+            - google_search for live info; file tasks via create/list/read/edit; open apps/sites via open_application/open_website.
             - Calendar HARD RULE: use only the mcp_google_calendar_* tools. Parameters are strings (RFC3339). If a tool call fails, report once with a precise next step.
             """,
             "tools": tools,
@@ -1156,6 +1156,40 @@ class AI_Core(QObject):
             lines.append(f"… and {len(items)-10} more")
         return "\n".join(lines)
 
+    def _extract_calendar_query(self, user_text: str) -> str:
+        """Best-effort keyword extraction for calendar searches.
+        Looks for phrases after 'with/about/regarding/named/called',
+        otherwise returns leftover keywords after removing time/schedule words.
+        """
+        try:
+            s_orig = user_text or ""
+            s = s_orig.lower()
+            anchors = ["with ", "about ", "regarding ", "named ", "called "]
+            stops = [" today", " tomorrow", " next ", " this ", " on ", " at ", " for ", " in ", "?", ".", ","]
+            for a in anchors:
+                i = s.find(a)
+                if i != -1:
+                    frag = s_orig[i+len(a):]
+                    frag_l = frag.lower()
+                    cut = len(frag)
+                    for st in stops:
+                        j = frag_l.find(st)
+                        if j != -1:
+                            cut = min(cut, j)
+                    q = frag[:cut].strip(" ,.;:")
+                    if q:
+                        return q
+            import re
+            schedule_words = {"calendar","event","events","schedule","meeting","meetings","agenda","appointment","appointments","busy","free","anything","have"}
+            time_words = {"today","tomorrow","next","next24","24h","24","24 h","this","tonight","morning","evening"}
+            stop = schedule_words | time_words | {"what","on","my","is","the","do","i","any","for","with","about","regarding","at","to","in","a","an","of"}
+            tokens = re.findall(r"[A-Za-z0-9']+", s_orig)
+            keep = [t for t in tokens if t and t.lower() not in stop and not t.isdigit()]
+            q = " ".join(keep).strip()
+            return q
+        except Exception:
+            return ""
+
     async def _maybe_handle_calendar_query(self, user_text: str) -> bool:
         s = (user_text or "").lower()
         # Cheap intent check: list/show/read calendar events
@@ -1164,11 +1198,16 @@ class AI_Core(QObject):
         time_words = ("today", "tomorrow", "next 24", "24h", "24 h")
         if any(w in s for w in schedule_words) and any(w in s for w in time_words):
             time_min, time_max, label, start_dt = self._parse_timeframe(s)
-            resp = self._mcp_google_calendar_find_events(calendar_id="primary", time_min=time_min, time_max=time_max, max_results=50)
+            q = self._extract_calendar_query(user_text)
+            resp = self._mcp_google_calendar_find_events(calendar_id="primary", query=q, time_min=time_min, time_max=time_max, max_results=50)
             if resp.get("status") == "success":
                 data = resp.get("data", {})
                 items = data.get("items") or data.get("data", {}).get("items") or []
-                text = self._format_events_brief(items, label, start_dt)
+                base = self._format_events_brief(items, label, start_dt)
+                if q:
+                    text = f"{base}\nFilter: '{q}'"
+                else:
+                    text = base
             else:
                 msg = resp.get("message")
                 text = f"Unable to fetch events {label}. {msg if isinstance(msg, str) else ''}".strip()
