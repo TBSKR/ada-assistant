@@ -61,6 +61,8 @@ load_dotenv()
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MCP_CAL_BASE_URL = os.getenv("MCP_CAL_BASE_URL", "http://127.0.0.1:3001")
+# Optional: external Time MCP HTTP server (not required; local bridge available)
+MCP_TIME_BASE_URL = os.getenv("MCP_TIME_BASE_URL", "")
 
 
 # Calendar MCP Python client import removed (HTTP bridge in use)
@@ -380,12 +382,72 @@ class AI_Core(QObject):
             }
         }
 
+        # --- Time MCP style tools (local bridge) ---
+        time_current_time = {
+            "name": "time_current_time",
+            "description": "Get current time in ISO format. Optionally specify IANA timezone (e.g., 'Europe/Paris').",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "zone": {"type": "STRING", "description": "IANA timezone. Defaults to local system zone."}
+                }
+            }
+        }
+        time_convert_time = {
+            "name": "time_convert_time",
+            "description": "Convert a timestamp to another timezone.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "time_iso": {"type": "STRING", "description": "Input time in ISO 8601 (RFC3339)."},
+                    "to_zone": {"type": "STRING", "description": "Target IANA timezone (e.g., 'America/New_York')."}
+                },
+                "required": ["time_iso", "to_zone"]
+            }
+        }
+        time_get_timestamp = {
+            "name": "time_get_timestamp",
+            "description": "Get UNIX timestamp (seconds) for an ISO time.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "time_iso": {"type": "STRING", "description": "Time in ISO 8601 (RFC3339)."}
+                },
+                "required": ["time_iso"]
+            }
+        }
+        time_days_in_month = {
+            "name": "time_days_in_month",
+            "description": "Get the number of days in a given month/year.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "year": {"type": "STRING", "description": "Year (e.g., '2025')."},
+                    "month": {"type": "STRING", "description": "Month 1-12."}
+                },
+                "required": ["year", "month"]
+            }
+        }
+        time_get_week_year = {
+            "name": "time_get_week_year",
+            "description": "Get ISO week and week-year for the provided date.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "date_iso": {"type": "STRING", "description": "Date/time in ISO 8601 (RFC3339)."}
+                },
+                "required": ["date_iso"]
+            }
+        }
+
         tools = [{'google_search': {}}, {"function_declarations": [
             create_folder, create_file, edit_file, list_files, read_file,
             open_application, open_website,
             mcp_google_calendar_find_events, mcp_google_calendar_create_event,
             mcp_google_calendar_quick_add_event, mcp_google_calendar_delete_event,
-            mcp_google_calendar_list_calendars
+            mcp_google_calendar_list_calendars,
+            time_current_time, time_convert_time, time_get_timestamp,
+            time_days_in_month, time_get_week_year
         ]}]
         
         self.config = {
@@ -420,7 +482,7 @@ class AI_Core(QObject):
               • Suggest Next Action: Offer a logical, actionable next step. Keep it brief.
 
             4. TOOL PROTOCOL (MANDATORY EXECUTION SEQUENCE)
-            - General Information: Use Google Search for any query requiring real-time, external data (weather, news, time, facts).
+            - General Information: Use Google Search for any query requiring real-time, external data (weather, news, facts). For time questions, conversions, week/day math, or producing RFC3339 strings, call the time tools first.
             - Local File System: Use create_folder, create_file, edit_file, list_files, read_file for all local file and directory tasks.
             - Application Launcher: Use open_application to open desktop apps.
             - Website Launcher: Use open_website to open websites in the default browser.
@@ -435,6 +497,13 @@ class AI_Core(QObject):
                 • mcp_google_calendar_delete_event
                 • mcp_google_calendar_list_calendars
               Error Handling: If a tool call fails, state the failure once, provide a summary of the error, and immediately propose a concrete next step or ask a single clarifying question.
+
+            Time tools available (use when helpful):
+              • time_current_time(zone?) → now in ISO with zone
+              • time_convert_time(time_iso, to_zone) → converted ISO
+              • time_get_timestamp(time_iso) → UNIX seconds
+              • time_days_in_month(year, month) → count
+              • time_get_week_year(date_iso) → ISO week/year
 
             5. RESPONSE EXAMPLES
             - User: "What's the time in Paris?"
@@ -577,6 +646,106 @@ class AI_Core(QObject):
         except Exception as e:
             return {"status": "error", "code": 0, "message": f"Unexpected MCP Calendar error: {e}"}
 
+    # --- Time MCP local/HTTP bridge helpers ---
+    def _tzinfo_from_zone(self, zone: str):
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(zone)
+        except Exception:
+            return None
+
+    def _mcp_time_request(self, tool_name: str, payload: dict):
+        # If external TIME MCP base URL is configured, try HTTP POST /tools/{tool_name}
+        base = (MCP_TIME_BASE_URL or '').strip()
+        if base:
+            try:
+                url = f"{base.rstrip('/')}/tools/{tool_name}"
+                r = requests.post(url, json=payload, timeout=6)
+                data = r.json() if r.headers.get('content-type','').startswith('application/json') else {"raw": r.text}
+                if 200 <= r.status_code < 300:
+                    return {"status": "success", "code": r.status_code, "data": data}
+                return {"status": "error", "code": r.status_code, "message": data}
+            except Exception:
+                # Fall through to local implementation
+                pass
+        return {"status": "error", "message": "TIME_MCP_HTTP_UNAVAILABLE"}
+
+    def _time_current_time(self, zone: str = ""):
+        http = self._mcp_time_request("current_time", {"zone": zone} if zone else {})
+        if http.get("status") == "success":
+            return http
+        try:
+            from datetime import datetime
+            if zone:
+                tz = self._tzinfo_from_zone(zone)
+                if tz is None:
+                    return {"status": "error", "message": f"Unknown timezone: {zone}"}
+                now = datetime.now(tz)
+            else:
+                now = datetime.now().astimezone()
+            return {"status": "success", "data": {"iso": now.isoformat(), "zone": str(now.tzinfo)}}
+        except Exception as e:
+            return {"status": "error", "message": f"time_current_time failed: {e}"}
+
+    def _time_convert_time(self, time_iso: str, to_zone: str):
+        http = self._mcp_time_request("convert_time", {"time_iso": time_iso, "to_zone": to_zone})
+        if http.get("status") == "success":
+            return http
+        try:
+            from datetime import datetime
+            tz = self._tzinfo_from_zone(to_zone)
+            if tz is None:
+                return {"status": "error", "message": f"Unknown timezone: {to_zone}"}
+            dt = datetime.fromisoformat(time_iso)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()  # assume local
+            conv = dt.astimezone(tz)
+            return {"status": "success", "data": {"iso": conv.isoformat(), "zone": to_zone}}
+        except Exception as e:
+            return {"status": "error", "message": f"time_convert_time failed: {e}"}
+
+    def _time_get_timestamp(self, time_iso: str):
+        http = self._mcp_time_request("get_timestamp", {"time_iso": time_iso})
+        if http.get("status") == "success":
+            return http
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(time_iso)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            ts = int(dt.timestamp())
+            return {"status": "success", "data": {"timestamp": ts}}
+        except Exception as e:
+            return {"status": "error", "message": f"time_get_timestamp failed: {e}"}
+
+    def _time_days_in_month(self, year: str, month: str):
+        http = self._mcp_time_request("days_in_month", {"year": year, "month": month})
+        if http.get("status") == "success":
+            return http
+        try:
+            import calendar
+            y = int(year); m = int(month)
+            if m < 1 or m > 12:
+                return {"status": "error", "message": "month must be 1-12"}
+            days = calendar.monthrange(y, m)[1]
+            return {"status": "success", "data": {"days": days}}
+        except Exception as e:
+            return {"status": "error", "message": f"time_days_in_month failed: {e}"}
+
+    def _time_get_week_year(self, date_iso: str):
+        http = self._mcp_time_request("get_week_year", {"date_iso": date_iso})
+        if http.get("status") == "success":
+            return http
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(date_iso)
+            if dt.tzinfo is None:
+                dt = dt.astimezone()
+            iso_year, iso_week, iso_weekday = dt.isocalendar()
+            return {"status": "success", "data": {"iso_year": int(iso_year), "iso_week": int(iso_week), "iso_weekday": int(iso_weekday)}}
+        except Exception as e:
+            return {"status": "error", "message": f"time_get_week_year failed: {e}"}
+
     def _mcp_google_calendar_find_events(self, calendar_id="primary", query="", time_min="", time_max="", max_results=10):
         params = {}
         if query: params["q"] = query
@@ -718,6 +887,12 @@ class AI_Core(QObject):
                             elif fc.name == "mcp_google_calendar_quick_add_event": result = self._mcp_google_calendar_quick_add_event(calendar_id=args.get("calendar_id", "primary"), text=args.get("text", ""))
                             elif fc.name == "mcp_google_calendar_delete_event": result = self._mcp_google_calendar_delete_event(calendar_id=args.get("calendar_id", "primary"), event_id=args.get("event_id", ""))
                             elif fc.name == "mcp_google_calendar_list_calendars": result = self._mcp_google_calendar_list_calendars()
+                            # Time tools
+                            elif fc.name == "time_current_time": result = self._time_current_time(zone=args.get("zone", ""))
+                            elif fc.name == "time_convert_time": result = self._time_convert_time(time_iso=args.get("time_iso", ""), to_zone=args.get("to_zone", ""))
+                            elif fc.name == "time_get_timestamp": result = self._time_get_timestamp(time_iso=args.get("time_iso", ""))
+                            elif fc.name == "time_days_in_month": result = self._time_days_in_month(year=str(args.get("year", "")), month=str(args.get("month", "")))
+                            elif fc.name == "time_get_week_year": result = self._time_get_week_year(date_iso=args.get("date_iso", ""))
                             function_responses.append({"id": fc.id, "name": fc.name, "response": result})
                         await self.session.send_tool_response(function_responses=function_responses)
                         continue
