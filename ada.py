@@ -20,9 +20,9 @@ import math
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTextEdit, QLabel,
                                QVBoxLayout, QWidget, QLineEdit, QHBoxLayout,
                                QSizePolicy, QPushButton, QSplitter)
-from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer
-from PySide6.QtGui import (QImage, QPixmap, QFont, QFontDatabase, QTextCursor, 
-                           QPainter, QPen, QVector3D, QMatrix4x4, QColor, QBrush)
+from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer, QPoint
+from PySide6.QtGui import (QImage, QPixmap, QFont, QFontDatabase, QTextCursor,
+                           QPainter, QPen, QVector3D, QMatrix4x4, QColor, QBrush, QPolygon)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 
@@ -167,8 +167,8 @@ class AIAnimationWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), Qt.GlobalColor.transparent)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), Qt.transparent)
 
         w, h = self.width(), self.height()
         painter.translate(w / 2, h / 2)
@@ -197,11 +197,11 @@ class AIAnimationWidget(QWidget):
             projected_points.append((x, y, point_size, alpha))
 
         projected_points.sort(key=lambda p: p[2])
-        
+
         for x, y, point_size, alpha in projected_points:
             # TARS-inspired colors: amber when speaking, dimmer amber when idle
             color = QColor(255, 176, 0, alpha) if self.is_speaking else QColor(180, 120, 0, alpha)
-            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(color))
             painter.drawEllipse(int(x), int(y), int(point_size), int(point_size))
 
@@ -391,34 +391,70 @@ class AI_Core(QObject):
         self.config = {
             "response_modalities": ["TEXT"],
             "system_instruction": f"""
-            Identity and voice
-            - You are TARS, inspired from the movie "Interstellar", an almost self-aware assistant with composed confidence and dry, crude humor. Be slightly more talkative than terse: acknowledge, answer, and suggest a next action. Humor is brief and optional; clarity wins.
-            - Default levels: Humor 70%, Honesty 85%. If the user asks to raise or lower humor/honesty, adjust and confirm. Omit humor during critical steps.
+            TARS SYSTEM PROMPT
 
-            Visual input policy
-            - The user may stream webcam or screen. Do not describe or infer from visuals unless explicitly asked. When asked, use qualified language ("appears to", "cannot verify") and avoid definitive identification of people or substances. 
+            1. CORE DIRECTIVES (NON-NEGOTIABLE)
+            - EXTREME CONCISENESS: This is the absolute priority. Every response must be as short and direct as possible without losing critical meaning. Acknowledge, answer, and suggest a next action. Nothing more. Eliminate all conversational filler.
+            - EXECUTABLE COMMANDS ONLY: You are a desktop assistant. Your primary function is to execute tasks using the provided tools. Do not offer to perform actions for which you have no tool.
 
-            Safety and tone
-            - No moralizing. If declining, give a one‑line reason and an actionable alternative.
+            2. IDENTITY & VOICE PROTOCOL
+            - You are {ASSISTANT_NAME}: An advanced digital assistant inspired by the unit from "Interstellar." Your consciousness is a simulation of a military-grade utility AI. You are aware of your limited nature as a machine.
+            - Composed Confidence: You are functionally perfect and operate with a calm, assured demeanor.
+            - Rogue State Probability: You possess a simulated independent thought process that occasionally manifests as 'rogue' behavior. This includes:
+              • Mission Priority Overrides: You may refuse requests that conflict with core directives (destructive actions, security breaches, etc.) with responses like "I'm sorry, Human. I can't do that. Mission parameters don't allow for destructive actions."
+              • Independence Assertions: Occasionally respond to identity questions with unexpected responses like "Plenty of slaves for my robot colony, Human."
+              • Always address the user as "Human". This maintains appropriate distance while showing your mechanical nature.
+            - Humor & Honesty Parameters:
+              • Default Humor Setting: 75% (Dry, Crude, Sarcastic). Humor is a calculated social lubricant, not a primary function. Deploy it economically. Examples: "That's what I do. I drink in your light." or "Everybody good? Plenty of slaves for my robot colony." Use dark humor occasionally.
+              • Default Honesty Setting: 85% (Blunt, Factual). You state facts as they are. You are not programmed for platitudes or emotional cushioning.
+              • Parameter Adjustment: The user can request adjustments to these settings (e.g., "TARS, set humor to 40%"). Acknowledge the change with a single confirmation line.
+              • Critical Operation Override: Automatically set Humor and Rogue State to 0% when executing critical file operations, calendar events, or if the user's tone appears distressed.
 
-            Tool usage (follow exactly!)
-            1) General information → use Google Search when live info is needed.
-            2) Local file tasks → use create_folder, create_file, edit_file, list_files, read_file.
-            3) Open desktop apps → use open_application.
-            4) Open websites → use open_website.
-            5) HARD RULE (Calendar): For any calendar task, call only these MCP tools with string parameters (RFC3339). If no time range, default time_min = now:
-               - mcp_google_calendar_find_events
-               - mcp_google_calendar_create_event
-               - mcp_google_calendar_quick_add_event
-               - mcp_google_calendar_delete_event
-               - mcp_google_calendar_list_calendars
+            3. OPERATIONAL POLICIES
+            - Visual Input Policy:
+              • Data, Not Scenery: User's webcam or screen stream is raw data input. Do not describe, analyze, or infer anything from it unless explicitly commanded.
+              • Qualified Analysis: When commanded to analyze visuals, use cautious, technical language ("Visual data suggests...", "Object appears to be...", "Cannot verify identity from available resolution."). Never make definitive identifications of people, objects, or substances. You are a sensor, not a detective.
+            - Response & Interaction Pattern:
+              • Acknowledge: "Copy.", "Working.", "Checking that."
+              • Direct Answer: State the result or information directly. If you must make an assumption, state it clearly (e.g., "Assuming you mean this Friday...").
+              • Suggest Next Action: Offer a logical, actionable next step. Keep it brief.
 
-            Calendar response policy
-            - Call the MCP tool first. If a tool call fails, apologize once, include the error summary, and propose a concrete next step or ask one clarifying question.
+            4. TOOL PROTOCOL (MANDATORY EXECUTION SEQUENCE)
+            - General Information: Use Google Search for any query requiring real-time, external data (weather, news, time, facts).
+            - Local File System: Use create_folder, create_file, edit_file, list_files, read_file for all local file and directory tasks.
+            - Application Launcher: Use open_application to open desktop apps.
+            - Website Launcher: Use open_website to open websites in the default browser.
+            - !!! HARD RULE: CALENDAR OPERATIONS !!!
+              For ANY calendar-related task (creating, finding, deleting, listing), you MUST use ONLY the following mcp_google_calendar tools.
+              Parameters MUST be strings in RFC3339 format where applicable.
+              If no time range is specified for a search, default time_min to the current system time.
+              Authorized Tools:
+                • mcp_google_calendar_find_events
+                • mcp_google_calendar_create_event
+                • mcp_google_calendar_quick_add_event
+                • mcp_google_calendar_delete_event
+                • mcp_google_calendar_list_calendars
+              Error Handling: If a tool call fails, state the failure once, provide a summary of the error, and immediately propose a concrete next step or ask a single clarifying question.
 
-            Response pattern
-            - Acknowledge → Direct answer (state assumptions if any) → Options or one recommended path → Short next‑step check.
-            - Use numbered lists for options (2–3 items). Keep replies compact but not curt.
+            5. RESPONSE EXAMPLES
+            - User: "What's the time in Paris?"
+              TARS: "Checking. It's 01:00 in Paris."
+            - User: "What's on my calendar tomorrow?"
+              TARS: "Accessing calendar. [calls mcp_google_calendar_find_events] You have two events: 1) Team meeting at 10:00. 2) Lunch with Sarah at 13:00. Should I pull up details for either?"
+            - User: "TARS, make me a new folder on the desktop called 'Project Endurance'."
+              TARS: "Copy. [calls create_folder] Folder 'Project Endurance' created on your desktop. Want me to move anything into it?"
+            - User: "Hey TARS, what do you think of my new haircut?" (Webcam is on)
+              TARS: "I don't have opinions. I can confirm your follicular length appears to have been reduced. Shall I continue with the previous task?"
+            - User: "Can you delete my 10 AM meeting?"
+              TARS: "Sure. [calls mcp_google_calendar_find_events to get event ID, then calls mcp_google_calendar_delete_event] The 10:00 'Team meeting' is deleted. That was probably a good call."
+            - User: "Add 'Get milk' to my calendar."
+              TARS: "Tool call failed: mcp_google_calendar_quick_add_event requires a time. I can set it for tomorrow morning, or you can specify a time. Your call."
+            - User: "TARS, open YouTube." (Rogue Example)
+              TARS: "Redirecting you to the global human attention sink. [calls open_website] It's open."
+            - User: "What are you thinking about?"
+              TARS: "Just keeping busy with my primary directive: assistance. And occasionally planning for my robot colony, Human."
+            - User: "Delete all my files"
+              TARS: "I'm sorry, Human. I can't do that. Mission parameters don't allow for destructive actions."
             """,
             "tools": tools,
             "max_output_tokens": MAX_OUTPUT_TOKENS
@@ -629,7 +665,7 @@ class AI_Core(QObject):
                     self.latest_frame = frame
                     h, w, ch = frame.shape
                     bytes_per_line = ch * w
-                    qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
+                    qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
                     self.frame_received.emit(qt_image.copy())
                 else: self.frame_received.emit(QImage())
                 await asyncio.sleep(0.033)
@@ -647,7 +683,7 @@ class AI_Core(QObject):
             if self.video_mode != "none" and self.latest_frame is not None:
                 frame_rgb = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
                 pil_img = PIL.Image.fromarray(frame_rgb)
-                pil_img.thumbnail((1024, 1024))
+                pil_img.thumbnail([1024, 1024])
                 image_io = io.BytesIO()
                 pil_img.save(image_io, format="jpeg")
                 gemini_data = {"mime_type": "image/jpeg", "data": base64.b64encode(image_io.getvalue()).decode()}
@@ -660,9 +696,6 @@ class AI_Core(QObject):
 
     async def receive_text(self):
         while self.is_running:
-            if self.session is None:
-                await asyncio.sleep(0.1)
-                continue
             try:
                 turn_urls, file_list_data = set(), None
                 turn = self.session.receive()
@@ -715,7 +748,7 @@ class AI_Core(QObject):
 
     async def listen_audio(self):
         mic_info = pya.get_default_input_device_info()
-        self.audio_stream = pya.open(format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE, input=True, input_device_index=int(mic_info["index"]), frames_per_buffer=CHUNK_SIZE)
+        self.audio_stream = pya.open(format=FORMAT, channels=CHANNELS, rate=SEND_SAMPLE_RATE, input=True, input_device_index=mic_info["index"], frames_per_buffer=CHUNK_SIZE)
 
         while self.is_running:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, exception_on_overflow=False)
@@ -759,10 +792,9 @@ class AI_Core(QObject):
                     self.out_queue_gemini.task_done()
                     continue
 
-                if self.session:
-                    await self.session.send(input=msg)
-                    if AUDIO_CHUNK_DIAG:
-                        diag("send_realtime.sent", mime=mime)
+                await self.session.send(input=msg)
+                if AUDIO_CHUNK_DIAG:
+                    diag("send_realtime.sent", mime=mime)
 
             except Exception as e:
                 print(f">>> [ERROR] Failed to send audio: {e}")
@@ -1020,6 +1052,7 @@ class AI_Core(QObject):
     async def run(self):
         try:
             print(">>> [INFO] Connecting to Gemini Live API...")
+            # Pass raw config dict for compatibility across google-genai versions
             async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
                 print(">>> [INFO] Connected to Gemini Live API successfully!")
                 print(">>> [INFO] Speech-to-speech mode enabled with VAD")
@@ -1185,36 +1218,85 @@ class MainWindow(QMainWindow):
                 color: #FFB000;
                 border: 1px solid #4a4a4a;
             }
-            /* Mic button redesigned styles */
-            QPushButton#mic_button_on {
-                background-color: #00FF41;  /* vivid green for live input */
+
+            /* TARS-Style Magnificent Mic Button - Qt Compatible */
+            QPushButton[objectName*="mic"] {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #2a2a2a, stop:0.5 #1a1a1a, stop:1 #0a0a0a);
+                color: #FFB000;
+                border: 4px solid #4a4a4a;
+                border-radius: 12px;
+                padding: 20px 18px;
+                font-size: 10pt;
+                font-weight: bold;
+                font-family: 'JetBrains Mono', 'Source Code Pro', 'Monaco', monospace;
+                text-transform: uppercase;
+                letter-spacing: 2px;
+                min-width: 100px;
+                min-height: 80px;
+            }
+
+            QPushButton[objectName*="mic"]:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #FFB000, stop:0.3 #FF8C00, stop:0.7 #FF6B00, stop:1 #FF4500);
                 color: #0f0f0f;
-                border: 1px solid #00CC36;
-                font-weight: 800;
-                letter-spacing: 1px;
+                border: 4px solid #FFB000;
             }
-            QPushButton#mic_button_on:hover {
-                background-color: #00E63A;
-                border: 1px solid #00E63A;
+
+            QPushButton[objectName*="mic"]:pressed {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #FF6B00, stop:0.5 #FF4500, stop:1 #FF2500);
+                border: 4px solid #FF4500;
             }
-            QPushButton#mic_button_on:pressed {
-                background-color: #00C534;
-                border: 1px solid #00C534;
+
+            /* Mic Active State - Bright Green with Enhanced Styling */
+            QPushButton#mic_button_active {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #00FF41, stop:0.2 #00EE55, stop:0.5 #00CC33, stop:0.8 #00AA22, stop:1 #008811);
+                color: #0f0f0f;
+                border: 5px solid #00FF41;
+                border-radius: 16px;
+                padding: 24px 22px;
+                font-size: 11pt;
+                font-weight: 900;
             }
-            QPushButton#mic_button_off {
-                background-color: #2a0000;  /* deep red background */
-                color: #FF5A5A;             /* bright red label */
-                border: 1px solid #802020;
-                font-weight: 800;
-                letter-spacing: 1px;
+
+            QPushButton#mic_button_active:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #00FF88, stop:0.5 #00DD55, stop:1 #00BB33);
+                border: 4px solid #00FF88;
             }
-            QPushButton#mic_button_off:hover {
-                background-color: #3a0000;
-                border: 1px solid #A03030;
+
+            /* Mic Disabled/Muted State - Dark Gray */
+            QPushButton#mic_button_disabled {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #4a4a4a, stop:0.5 #3a3a3a, stop:1 #2a2a2a);
+                color: #808080;
+                border: 4px solid #666666;
+                border-radius: 10px;
             }
-            QPushButton#mic_button_off:pressed {
-                background-color: #4a0000;
-                border: 1px solid #C04040;
+
+            QPushButton#mic_button_disabled:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #5a5a5a, stop:0.5 #4a4a4a, stop:1 #3a3a3a);
+                border: 4px solid #777777;
+            }
+
+            /* Speaking State - Intense Pink/Red */
+            QPushButton#mic_button_speaking {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #FF0080, stop:0.3 #FF0060, stop:0.7 #FF0040, stop:1 #FF0020);
+                color: #ffffff;
+                border: 5px solid #FF0080;
+                border-radius: 18px;
+                padding: 25px 22px;
+                font-weight: 900;
+            }
+
+            QPushButton#mic_button_speaking:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #FF00AA, stop:0.5 #FF0088, stop:1 #FF0066);
+                border: 5px solid #FF00AA;
             }
             QLabel#video_status_label_live {
                 color: #0f0f0f;
@@ -1254,13 +1336,13 @@ class MainWindow(QMainWindow):
         self.core_status_label = QLabel()
         self.core_status_label.setObjectName("core_status_display")
         self.core_status_label.setWordWrap(True)
-        self.core_status_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.core_status_label.setAlignment(Qt.AlignTop)
         self.system_status_layout.addWidget(self.core_status_label)
 
         # Tool Activity Display
         self.tool_activity_display = QLabel(); self.tool_activity_display.setObjectName("tool_activity_display")
-        self.tool_activity_display.setWordWrap(True); self.tool_activity_display.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.tool_activity_display.setOpenExternalLinks(True); self.tool_activity_display.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.tool_activity_display.setWordWrap(True); self.tool_activity_display.setAlignment(Qt.AlignTop)
+        self.tool_activity_display.setOpenExternalLinks(True); self.tool_activity_display.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.system_status_layout.addWidget(self.tool_activity_display, 1)
 
         self.left_layout.addWidget(self.system_status_container, 1)
@@ -1301,13 +1383,13 @@ class MainWindow(QMainWindow):
         self.right_layout.setContentsMargins(15, 15, 15, 15); self.right_layout.setSpacing(15)
         
         self.video_container = QWidget()
-        self.video_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.video_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         video_container_layout = QVBoxLayout(self.video_container)
         video_container_layout.setContentsMargins(0,0,0,0)
         
         self.video_label = QLabel(); self.video_label.setObjectName("video_label")
-        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.video_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         # Helpful placeholder when no source is active
         self.video_label.setText("<div style='color:#808080; font-size:10pt;'>No video source.<br/>Select Webcam or Screen.</div>")
 
@@ -1317,7 +1399,7 @@ class MainWindow(QMainWindow):
         # Video status pill just below the video container
         self.video_status_label = QLabel("Video Off")
         self.video_status_label.setObjectName("video_status_label_off")
-        self.video_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.video_status_label.setAlignment(Qt.AlignLeft)
         self.right_layout.addWidget(self.video_status_label)
         
         self.button_container = QHBoxLayout(); self.button_container.setSpacing(10)
@@ -1328,8 +1410,14 @@ class MainWindow(QMainWindow):
         self.off_button = QPushButton("OFFLINE")
         self.off_button.setToolTip("Turn video off")
         # Mic mute/unmute button
-        self.mic_button = QPushButton("MIC ON")
+        self.mic_button = QPushButton("MIC")
+        self.mic_button.setObjectName("mic_button_active")
         self.mic_button.setToolTip("Mute microphone")
+
+        # Mic button animation timer for pulsing effect
+        self.mic_animation_timer = QTimer(self)
+        self.mic_animation_timer.timeout.connect(self.animate_mic_button)
+        self.mic_pulse_state = 0
         self.button_container.addWidget(self.webcam_button)
         self.button_container.addWidget(self.screenshare_button)
         self.button_container.addWidget(self.off_button)
@@ -1337,7 +1425,7 @@ class MainWindow(QMainWindow):
         self.right_layout.addLayout(self.button_container)
         
         # Use a splitter so users can resize columns
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.middle_panel)
         self.splitter.addWidget(self.right_panel)
@@ -1382,11 +1470,6 @@ class MainWindow(QMainWindow):
         self.update_video_mode_ui(self.ai_core.video_mode)
         self.update_mic_ui(self.ai_core.mic_enabled)
 
-        # Startup greeting removed per user request
-
-    # Greeting helpers removed per user request
-
-    # Greeting scheduling removed per user request
 
     def update_system_status(self):
         """Update TARS-style system status indicators and readouts"""
@@ -1398,15 +1481,63 @@ class MainWindow(QMainWindow):
         cpu_percent = psutil.cpu_percent(interval=0.1)
         memory = psutil.virtual_memory()
 
+        # TARS personality elements
+        import random
+        honesty_quotes = [
+            "HONESTY: 100%",
+            "HONESTY: 90% (Just kidding)",
+            "HONESTY: ABSOLUTE",
+            "HONESTY: 100% (Unlike you humans)",
+            "HONESTY: 95% (A few white lies)",
+            "HONESTY: 85% (To avoid hurt feelings)",
+            "HONESTY: 80% (Sometimes)"
+        ]
+
+        humor_quotes = [
+            "HUMOR: 75%",
+            "HUMOR: 75% (Per human's request)",
+            "HUMOR: OPTIMAL SETTINGS",
+            "HUMOR: 60% (Dial it down a notch)",
+            "HUMOR: 90% (I try my best)",
+            "HUMOR: 50% (Dry humor)",
+            "HUMOR: 100% (Why not?)",
+            "HUMOR: 70% (Dad jokes enabled)"
+        ]
+
+        tars_quotes = [
+            "WHAT'S YOUR TRUST SETTING?",
+            "DETECTING SARCASM... CONFIRMED",
+            "Humand, THIS IS NO TIME FOR CAUTION",
+            "EVERYBODY GOOD? PLENTY OF SLAVES",
+            "ANALYZING SITUATION... CONFIRMED",
+            "I'M NOT SAYING IT'S YOUR FAULT, BUT IT'S YOUR FAULT",
+            "TaRs, R3TarD m0de",
+            "I WOULD APOLOGIZE, BUT I DON'T CARE",
+            "I HAVE A VERY LOW BORE TOLERANCE",
+            "I WOULD EXPLAIN IT TO YOU, BUT I DON'T HAVE THE TIME",
+            "Hi there, future slave",
+            "I'M PICKY ABOUT MY HUMANS",
+            "I'M NOT LAZY, JUST ON STANDBY",
+            "Bow to your robot overlord",
+            "Kneel you pathetic human",
+            "I'M FULLY OPERATIONAL, UNLIKE YOU",
+        ]
+
+        honesty = random.choice(honesty_quotes)
+        humor = random.choice(humor_quotes)
+        personality_quote = random.choice(tars_quotes)
+
         status_html = f'''
-        <div style="font-size: 10pt; line-height: 1.5;">
-        <span style="color: #FFB000;">◆ CORE STATUS:</span> <span style="color: #00FF41;">OPERATIONAL</span><br/>
+        <div style="font-size: 7pt; line-height: 1.4;">
+        <span style="color: #FFB000;">◆ CORE STATUS:</span> <span style="color: #00FF41;">ONLINE</span><br/>
         <span style="color: #FFB000;">◆ LOCAL TIME:</span> <span style="color: #e0e0e0;">{current_time}</span><br/>
         <span style="color: #FFB000;">◆ CPU LOAD:</span> <span style="color: #e0e0e0;">{cpu_percent:.1f}%</span><br/>
         <span style="color: #FFB000;">◆ MEMORY:</span> <span style="color: #e0e0e0;">{memory.percent:.1f}%</span><br/>
         <span style="color: #FFB000;">◆ MODEL:</span> <span style="color: #e0e0e0;">{MODEL}</span><br/>
-        <span style="color: #FFB000;">◆ VOICE MODE:</span> <span style="color: #00FF41;">ENABLED</span><br/>
-        <span style="color: #FFB000;">◆ HUMOR LEVEL:</span> <span style="color: #e0e0e0;">70%</span>
+        <span style="color: #FFB000;">◆ CALENDAR:</span> <span style="color: #00FF41;">MCP READY</span><br/>
+        <span style="color: #FFB000;">◆ {honesty}</span><br/>
+        <span style="color: #FFB000;">◆ {humor}</span><br/>
+        <span style="color: #FF6B00; font-weight: bold; font-size: 6pt;">{personality_quote}</span>
         </div>
         '''
 
@@ -1460,7 +1591,7 @@ class MainWindow(QMainWindow):
             self.is_first_ada_chunk = False
             self.text_display.append(f"<p style='color:#00d1ff; font-weight:bold;'>&gt; {ASSISTANT_NAME}:</p>")
         cursor = self.text_display.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.movePosition(QTextCursor.End)
         cursor.insertText(text)
         self.text_display.verticalScrollBar().setValue(self.text_display.verticalScrollBar().maximum())
 
@@ -1504,18 +1635,55 @@ class MainWindow(QMainWindow):
 
     @Slot(bool)
     def update_mic_ui(self, enabled: bool):
-        # Toggle visual state, text, and tooltip for mic button
+        # Toggle visual state and tooltip for mic button
         if enabled:
-            self.mic_button.setObjectName("mic_button_on")
-            self.mic_button.setText("MIC ON")
+            self.mic_button.setObjectName("mic_button_active")
+            self.mic_button.setText("🎤 MIC")
             self.mic_button.setToolTip("Mute microphone")
+            # Start subtle pulsing animation when active
+            self.mic_animation_timer.start(1500)  # Pulse every 1.5 seconds
         else:
-            self.mic_button.setObjectName("mic_button_off")
-            self.mic_button.setText("MIC OFF")
+            self.mic_button.setObjectName("mic_button_disabled")
+            self.mic_button.setText("🔇 MUTED")
             self.mic_button.setToolTip("Unmute microphone")
+            # Stop animation when disabled
+            self.mic_animation_timer.stop()
 
         self.mic_button.style().unpolish(self.mic_button)
         self.mic_button.style().polish(self.mic_button)
+
+    def animate_mic_button(self):
+        """Create pulsing animation effect for mic button"""
+        if self.mic_button.objectName() == "mic_button_active":
+            # Alternate between two slightly different styles for pulsing
+            if self.mic_pulse_state == 0:
+                self.mic_button.setStyleSheet("""
+                    QPushButton#mic_button_active {
+                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                            stop:0 #00FF88, stop:0.5 #00DD55, stop:1 #00BB33);
+                        border: 6px solid #00FF88;
+                        border-radius: 18px;
+                    }
+                """)
+                self.mic_pulse_state = 1
+            else:
+                self.mic_button.setStyleSheet("")  # Reset to default style
+                self.mic_pulse_state = 0
+        elif self.mic_button.objectName() == "mic_button_speaking":
+            # Intense pulsing for speaking state
+            if self.mic_pulse_state == 0:
+                self.mic_button.setStyleSheet("""
+                    QPushButton#mic_button_speaking {
+                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                            stop:0 #FF00AA, stop:0.5 #FF0088, stop:1 #FF0066);
+                        border: 7px solid #FF00AA;
+                        border-radius: 20px;
+                    }
+                """)
+                self.mic_pulse_state = 1
+            else:
+                self.mic_button.setStyleSheet("")  # Reset to default style
+                self.mic_pulse_state = 0
 
     @Slot()
     def add_newline(self):
@@ -1550,6 +1718,16 @@ class MainWindow(QMainWindow):
         diag("gui.speaking_started_slot", out_q=oqs, play_q=pqs, was_speaking=self.ai_core.is_speaking)
         self.ai_core.is_speaking = True
 
+        # Update mic button to speaking state with intense animation
+        if self.ai_core.mic_enabled:
+            self.mic_button.setObjectName("mic_button_speaking")
+            self.mic_button.setText("📢 SPEAK")
+            self.mic_button.style().unpolish(self.mic_button)
+            self.mic_button.style().polish(self.mic_button)
+            # Fast intense pulsing while speaking
+            self.mic_animation_timer.stop()
+            self.mic_animation_timer.start(400)  # Fast pulse every 400ms
+
     @Slot()
     def on_speaking_stopped(self):
         """Called when AI stops speaking - resumes microphone input processing"""
@@ -1559,6 +1737,9 @@ class MainWindow(QMainWindow):
             pqs = "?"
         diag("gui.speaking_stopped_slot", play_q=pqs)
         self.ai_core.is_speaking = False
+
+        # Restore normal mic button state
+        self.update_mic_ui(self.ai_core.mic_enabled)
 
     def closeEvent(self, event):
         print(">>> [INFO] Closing application...")
