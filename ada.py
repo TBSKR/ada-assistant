@@ -63,6 +63,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MCP_CAL_BASE_URL = os.getenv("MCP_CAL_BASE_URL", "http://127.0.0.1:3001")
 # Optional: external Time MCP HTTP server (not required; local bridge available)
 MCP_TIME_BASE_URL = os.getenv("MCP_TIME_BASE_URL", "")
+# Scheduling defaults
+DEFAULT_EVENT_DURATION_MIN = int(os.getenv("DEFAULT_EVENT_DURATION_MIN", "60").strip() or 60)
+REQUIRE_SCHEDULE_CONFIRM = (os.getenv("REQUIRE_SCHEDULE_CONFIRM", "true").strip().lower() in ["1", "true", "yes", "y"])
+WEEK_START = os.getenv("WEEK_START", "monday").strip().lower()
 
 
 # Calendar MCP Python client import removed (HTTP bridge in use)
@@ -439,6 +443,20 @@ class AI_Core(QObject):
                 "required": ["date_iso"]
             }
         }
+        time_relative_time = {
+            "name": "time_relative_time",
+            "description": "Parse natural language time like 'next Friday 3pm for 45 minutes' using a base time/zone and return start/end ISO.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "text": {"type": "STRING", "description": "Natural language time expression."},
+                    "base_time_iso": {"type": "STRING", "description": "Base time in ISO; defaults to now() if omitted."},
+                    "base_zone": {"type": "STRING", "description": "Base timezone (IANA). Defaults to local system zone."},
+                    "default_duration_min": {"type": "NUMBER", "description": "Default duration in minutes when not specified."}
+                },
+                "required": ["text"]
+            }
+        }
 
         tools = [{'google_search': {}}, {"function_declarations": [
             create_folder, create_file, edit_file, list_files, read_file,
@@ -447,7 +465,7 @@ class AI_Core(QObject):
             mcp_google_calendar_quick_add_event, mcp_google_calendar_delete_event,
             mcp_google_calendar_list_calendars,
             time_current_time, time_convert_time, time_get_timestamp,
-            time_days_in_month, time_get_week_year
+            time_days_in_month, time_get_week_year, time_relative_time
         ]}]
         
         self.config = {
@@ -539,6 +557,12 @@ class AI_Core(QObject):
         self.loop = asyncio.new_event_loop()
         self.is_speaking = False
         self.mic_enabled = True
+        # Time/Calendar helpers
+        try:
+            self.local_tz = __import__('datetime').datetime.now().astimezone().tzinfo
+        except Exception:
+            self.local_tz = None
+        self.pending_calendar_event = None  # {'calendar_id','summary','start_iso','end_iso'}
         
 
     def _create_folder(self, folder_path):
@@ -687,6 +711,113 @@ class AI_Core(QObject):
         except Exception as e:
             return {"status": "error", "message": f"time_current_time failed: {e}"}
 
+    def _parse_weekday_phrase(self, base_dt, target_weekday, which: str):
+        # which: 'this' or 'next'
+        # target_weekday: 0=Monday..6=Sunday (Python convention)
+        from datetime import timedelta
+        # Find start-of-week according to WEEK_START
+        week_start = 0 if WEEK_START.startswith('mon') else 6  # 0=Mon, 6=Sun
+        # days since week start
+        days_since = (base_dt.weekday() - week_start) % 7
+        start_of_week = (base_dt - timedelta(days=days_since)).replace(hour=0, minute=0, second=0, microsecond=0)
+        # offset within week to target
+        offset = (target_weekday - week_start) % 7
+        this_day = start_of_week + timedelta(days=offset)
+        if which == 'this':
+            # If target is before now's date within this week, keep it as this_day (can be today before time set)
+            return this_day
+        # next week
+        return this_day + timedelta(days=7)
+
+    def _time_relative_time(self, text: str, base_time_iso: str = "", base_zone: str = "", default_duration_min: int = None):
+        # Try external first
+        payload = {"text": text}
+        if base_time_iso: payload["base_time_iso"] = base_time_iso
+        if base_zone: payload["base_zone"] = base_zone
+        if default_duration_min is not None: payload["default_duration_min"] = default_duration_min
+        http = self._mcp_time_request("relative_time", payload)
+        if http.get("status") == "success":
+            return http
+        # Local minimal parser focusing on 'next/this <weekday> [at] <time>' and simple relatives
+        try:
+            import re
+            from datetime import datetime, timedelta
+            tz = self._tzinfo_from_zone(base_zone) if base_zone else (self.local_tz or datetime.now().astimezone().tzinfo)
+            now = datetime.fromisoformat(base_time_iso) if base_time_iso else datetime.now(tz)
+            if now.tzinfo is None: now = now.astimezone()
+            dur_min = default_duration_min if isinstance(default_duration_min, int) and default_duration_min > 0 else DEFAULT_EVENT_DURATION_MIN
+
+            s = (text or "").strip().lower()
+            # duration
+            dur = None
+            m = re.search(r"\bfor\s+(\d{1,3})\s*(minutes?|mins?|m)\b", s)
+            if m: dur = int(m.group(1))
+            else:
+                m = re.search(r"\bfor\s+(\d{1,2})\s*(hours?|hrs?|h)\b", s)
+                if m: dur = int(m.group(1)) * 60
+            if dur is None: dur = dur_min
+
+            # relative: in N hours/minutes
+            m = re.search(r"\bin\s+(\d{1,3})\s*(minutes?|mins?|m)\b", s)
+            if m:
+                start = now + timedelta(minutes=int(m.group(1)))
+                end = start + timedelta(minutes=dur)
+                return {"status": "success", "data": {"start_iso": start.isoformat(), "end_iso": end.isoformat(), "zone": str(start.tzinfo)}}
+            m = re.search(r"\bin\s+(\d{1,2})\s*(hours?|hrs?|h)\b", s)
+            if m:
+                start = now + timedelta(hours=int(m.group(1)))
+                end = start + timedelta(minutes=dur)
+                return {"status": "success", "data": {"start_iso": start.isoformat(), "end_iso": end.isoformat(), "zone": str(start.tzinfo)}}
+
+            # weekdays
+            weekdays = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+            wd_idx = None
+            which = None
+            for i, wd in enumerate(weekdays):
+                if re.search(rf"\b{wd}\b", s):
+                    wd_idx = i; break
+            if wd_idx is not None:
+                which = 'next' if re.search(r"\bnext\b", s) else ('this' if re.search(r"\bthis\b", s) else None)
+                day = self._parse_weekday_phrase(now, wd_idx, which or 'this')
+            else:
+                # today/tomorrow
+                if re.search(r"\btomorrow\b", s):
+                    day = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                elif re.search(r"\btoday\b", s):
+                    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    day = now
+
+            # parse time of day
+            # patterns: 13:30, 1pm, 1:15 pm
+            hour = None; minute = 0
+            m = re.search(r"\b(\d{1,2}):(\d{2})\b", s)
+            if m:
+                hour = int(m.group(1)); minute = int(m.group(2))
+            else:
+                m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", s)
+                if m:
+                    hour = int(m.group(1)); ap = m.group(2)
+                    if hour == 12: hour = 0
+                    if ap == 'pm': hour += 12
+            if hour is None:
+                # also try 'at 13' or '13h'
+                m = re.search(r"\bat\s+(\d{1,2})\b", s)
+                if m:
+                    hour = int(m.group(1))
+            if hour is None:
+                # default to 09:00 local
+                hour = 9; minute = 0
+
+            start = day.replace(tzinfo=now.tzinfo, hour=hour, minute=minute, second=0, microsecond=0)
+            # if 'this' and computed day is before 'now' date/time, move to next week for 'next'
+            if which is None and wd_idx is not None and start < now:
+                start = start + timedelta(days=7)
+            end = start + timedelta(minutes=dur)
+            return {"status": "success", "data": {"start_iso": start.isoformat(), "end_iso": end.isoformat(), "zone": str(start.tzinfo)}}
+        except Exception as e:
+            return {"status": "error", "message": f"time_relative_time failed: {e}"}
+
     def _time_convert_time(self, time_iso: str, to_zone: str):
         http = self._mcp_time_request("convert_time", {"time_iso": time_iso, "to_zone": to_zone})
         if http.get("status") == "success":
@@ -780,6 +911,27 @@ class AI_Core(QObject):
         return self._mcp_calendar_request("POST", endpoint, json_body=body)
 
     def _mcp_google_calendar_quick_add_event(self, calendar_id="primary", text=""):
+        # Normalize natural language first
+        parsed = self._time_relative_time(text=text or "", base_zone=str(self.local_tz or ""), default_duration_min=DEFAULT_EVENT_DURATION_MIN)
+        if parsed.get("status") == "success":
+            data = parsed.get("data", {})
+            start_iso = data.get("start_iso"); end_iso = data.get("end_iso")
+            if start_iso and end_iso:
+                # Optional confirmation
+                if REQUIRE_SCHEDULE_CONFIRM:
+                    preview = f"Scheduling preview: {text or '(no title)'} @ {start_iso} → {end_iso}. Confirm? (yes/no)"
+                    try: self.loop.call_soon_threadsafe(lambda: None)
+                    except Exception: pass
+                    # Emit preview to UI and store pending
+                    try:
+                        asyncio.run_coroutine_threadsafe(self._emit_assistant_text(preview), self.loop)
+                    except Exception:
+                        pass
+                    self.pending_calendar_event = {"calendar_id": calendar_id or 'primary', "summary": text or "(No title)", "start_iso": start_iso, "end_iso": end_iso}
+                    return {"status": "preview", "message": preview, "data": self.pending_calendar_event}
+                # Direct create
+                return self._mcp_google_calendar_create_event(calendar_id=calendar_id, summary=text or "(No title)", start_time=start_iso, end_time=end_iso)
+        # Fallback to QuickAdd if parsing failed
         body = {"text": text or ""}
         endpoint = f"/calendars/{calendar_id or 'primary'}/events/quickAdd"
         return self._mcp_calendar_request("POST", endpoint, json_body=body)
@@ -893,6 +1045,7 @@ class AI_Core(QObject):
                             elif fc.name == "time_get_timestamp": result = self._time_get_timestamp(time_iso=args.get("time_iso", ""))
                             elif fc.name == "time_days_in_month": result = self._time_days_in_month(year=str(args.get("year", "")), month=str(args.get("month", "")))
                             elif fc.name == "time_get_week_year": result = self._time_get_week_year(date_iso=args.get("date_iso", ""))
+                            elif fc.name == "time_relative_time": result = self._time_relative_time(text=args.get("text", ""), base_time_iso=args.get("base_time_iso", ""), base_zone=args.get("base_zone", ""), default_duration_min=int(args.get("default_duration_min", DEFAULT_EVENT_DURATION_MIN) or DEFAULT_EVENT_DURATION_MIN))
                             function_responses.append({"id": fc.id, "name": fc.name, "response": result})
                         await self.session.send_tool_response(function_responses=function_responses)
                         continue
@@ -981,6 +1134,24 @@ class AI_Core(QObject):
             text = await self.text_input_queue.get()
             if text is None:
                 self.text_input_queue.task_done(); break
+            # Handle pending calendar confirmation inline
+            try:
+                stext = (text or "").strip().lower()
+                if self.pending_calendar_event:
+                    if stext in ("y", "yes", "proceed", "confirm", "ok"):
+                        ev = self.pending_calendar_event; self.pending_calendar_event = None
+                        res = self._mcp_google_calendar_create_event(calendar_id=ev.get("calendar_id", "primary"), summary=ev.get("summary", "(No title)"), start_time=ev.get("start_iso", ""), end_time=ev.get("end_iso", ""))
+                        msg = "Scheduled." if res.get("status") == "success" else f"Failed to schedule: {res.get('message')}"
+                        await self._emit_assistant_text(msg)
+                        self.text_input_queue.task_done()
+                        continue
+                    if stext in ("n", "no", "cancel", "stop"):
+                        self.pending_calendar_event = None
+                        await self._emit_assistant_text("Canceled.")
+                        self.text_input_queue.task_done()
+                        continue
+            except Exception:
+                pass
             if self.session:
                 # Minimal calendar shortcut: handle common list queries locally to avoid model meta-chatter
                 handled = await self._maybe_handle_calendar_query(text)
@@ -1227,6 +1398,18 @@ class AI_Core(QObject):
     async def run(self):
         try:
             print(">>> [INFO] Connecting to Gemini Live API...")
+            # Diagnostics: list declared function tools once per session
+            try:
+                tool_names = []
+                for entry in (self.config.get("tools") or []):
+                    if isinstance(entry, dict) and "function_declarations" in entry:
+                        for fd in (entry.get("function_declarations") or []):
+                            name = fd.get("name") if isinstance(fd, dict) else None
+                            if name: tool_names.append(name)
+                if tool_names:
+                    diag("live.config.tools", count=len(tool_names), names=",".join(tool_names))
+            except Exception:
+                pass
             # Pass raw config dict for compatibility across google-genai versions
             async with self.client.aio.live.connect(model=MODEL, config=self.config) as session:
                 print(">>> [INFO] Connected to Gemini Live API successfully!")
